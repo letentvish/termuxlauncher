@@ -11,13 +11,6 @@ import urllib.parse
 import traceback
 import shutil
 
-# Default configuration ports
-PORTS = {
-    "Frontend": 3000,
-    "Backend": 8000,
-    "AI Engine": 8010
-}
-
 def read_env(filepath):
     values = {}
     if os.path.exists(filepath):
@@ -37,20 +30,170 @@ def write_env(filepath, new_values):
         for k, v in sorted(values.items()):
             f.write(f"{k}={v}\n")
 
+class AppConfig:
+    def __init__(self, app_dir):
+        self.app_dir = os.path.abspath(app_dir)
+        self.manifest_path = os.path.join(self.app_dir, "launcher.json")
+        self.services = {}
+        self.env_keys = []
+        self.load()
+
+    def load(self):
+        # 1. Try to load launcher.json
+        if os.path.exists(self.manifest_path):
+            try:
+                with open(self.manifest_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.services = data.get("services", {})
+                    self.env_keys = data.get("required_keys", [])
+                    return
+            except Exception as e:
+                print(f"Error loading launcher.json: {e}")
+
+        # 2. Heuristics fallback stack detection
+        detected_services = {}
+        
+        # Check backend
+        be_candidates = ["backend", "api", "server"]
+        be_dir = None
+        be_entry = None
+        for cand in be_candidates:
+            path = os.path.join(self.app_dir, cand)
+            if os.path.isdir(path):
+                for entry in ["main.py", "app.py", "wsgi.py", "server.py"]:
+                    if os.path.exists(os.path.join(path, entry)):
+                        be_dir = path
+                        be_entry = entry
+                        break
+                if be_dir:
+                    break
+        
+        # Fallback to root directory
+        if not be_dir:
+            for entry in ["main.py", "app.py"]:
+                if os.path.exists(os.path.join(self.app_dir, entry)):
+                    be_dir = self.app_dir
+                    be_entry = entry
+                    break
+
+        if be_entry:
+            if be_entry.endswith(".py"):
+                detected_services["Backend"] = {
+                    "path": be_dir,
+                    "runtime": "python",
+                    "cmd": ["python", "-m", "uvicorn", f"{be_entry.split('.')[0]}:app", "--port", "8000", "--host", "0.0.0.0"],
+                    "port": 8000
+                }
+            elif be_entry.endswith(".js"):
+                detected_services["Backend"] = {
+                    "path": be_dir,
+                    "runtime": "node",
+                    "cmd": ["node", be_entry],
+                    "port": 8000
+                }
+
+        # Check AI Engine
+        ai_candidates = ["ai_engine", "agent", "ai"]
+        ai_dir = None
+        for cand in ai_candidates:
+            path = os.path.join(self.app_dir, cand)
+            if os.path.isdir(path):
+                if os.path.exists(os.path.join(path, "main.py")) or os.path.exists(os.path.join(path, "app.py")):
+                    ai_dir = path
+                    break
+        
+        if ai_dir:
+            detected_services["AI Engine"] = {
+                "path": ai_dir,
+                "runtime": "python",
+                "cmd": ["python", "-m", "uvicorn", "main:app", "--port", "8010", "--host", "0.0.0.0"],
+                "port": 8010
+            }
+
+        # Check Frontend
+        fe_candidates = ["frontend", "client", "ui", "web"]
+        fe_dir = None
+        for cand in fe_candidates:
+            path = os.path.join(self.app_dir, cand)
+            if os.path.isdir(path) and os.path.exists(os.path.join(path, "package.json")):
+                fe_dir = path
+                break
+        
+        if not fe_dir and os.path.exists(os.path.join(self.app_dir, "package.json")):
+            fe_dir = self.app_dir
+
+        if fe_dir is not None:
+            detected_services["Frontend"] = {
+                "path": fe_dir,
+                "runtime": "node",
+                "cmd": ["npm", "run", "dev"],
+                "port": 3000
+            }
+
+        self.services = detected_services
+
+        # 3. Detect env keys from .env.example files
+        detected_keys = []
+        for root, dirs, files in os.walk(self.app_dir):
+            if any(x in root for x in ["node_modules", ".git", "venv", ".venv"]):
+                continue
+            for f in files:
+                if f == ".env.example" or f == ".env":
+                    env_ex_path = os.path.join(root, f)
+                    try:
+                        with open(env_ex_path, "r", encoding="utf-8") as file:
+                            for line in file:
+                                line = line.strip()
+                                if line and not line.startswith("#") and "=" in line:
+                                    k = line.split("=", 1)[0].strip()
+                                    if k and k not in [dk["key"] for dk in detected_keys]:
+                                        is_secret = any(s in k.upper() for s in ["KEY", "SECRET", "PASS", "TOKEN"])
+                                        detected_keys.append({
+                                            "key": k,
+                                            "description": f"Env Key: {k}",
+                                            "secret": is_secret,
+                                            "dir": root
+                                        })
+                    except:
+                        pass
+        
+        # Add basic fallbacks if no keys found
+        if not detected_keys:
+            default_keys = ["OPENAI_API_KEY", "GOOGLE_API_KEY", "NVIDIA_API_KEY", "TAVILY_API_KEY"]
+            for dk in default_keys:
+                detected_keys.append({
+                    "key": dk,
+                    "description": f"Fallback: {dk}",
+                    "secret": True,
+                    "dir": self.app_dir if not detected_services else list(detected_services.values())[0]["path"]
+                })
+
+        self.env_keys = detected_keys
+
 class ProcessManager:
     def __init__(self):
-        self.processes = {
-            "Frontend": None,
-            "Backend": None,
-            "AI Engine": None
-        }
+        self.processes = {}
         self.logs = []
         self.lock = threading.Lock()
         self.launcher_dir = os.path.dirname(os.path.abspath(__file__))
         self.apps_dir = os.path.join(self.launcher_dir, "apps")
         os.makedirs(self.apps_dir, exist_ok=True)
+        
+        # Default to launcher directory
         self.project_dir = os.path.abspath(self.launcher_dir)
+        self.app_config = AppConfig(self.project_dir)
+        
         self.log_limit = 1000
+
+    def set_project_dir(self, path):
+        with self.lock:
+            # Stop existing processes
+            for name in list(self.processes.keys()):
+                self._stop_service_locked(name)
+            
+            self.project_dir = os.path.abspath(path)
+            self.app_config = AppConfig(self.project_dir)
+            self.processes = {name: None for name in self.app_config.services}
 
     def add_log(self, text, stream="system"):
         with self.lock:
@@ -59,16 +202,21 @@ class ProcessManager:
                 self.logs.pop(0)
 
     def is_port_in_use(self, port):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.1)
-            return s.connect_ex(('127.0.0.1', port)) == 0
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.1)
+                return s.connect_ex(('127.0.0.1', port)) == 0
+        except:
+            return False
 
     def get_status(self, name):
-        port = PORTS.get(name)
-        if not port:
+        svc = self.app_config.services.get(name)
+        if not svc:
             return "UNKNOWN"
         
-        in_use = self.is_port_in_use(port)
+        port = svc.get("port")
+        in_use = self.is_port_in_use(port) if port else False
+        
         with self.lock:
             proc = self.processes.get(name)
         
@@ -78,26 +226,6 @@ class ProcessManager:
             return "BUSY (EXTERNAL)"
         return "STOPPED"
 
-    def ensure_backend_env(self):
-        env_path = os.path.join(self.project_dir, "backend", ".env")
-        os.makedirs(os.path.dirname(env_path), exist_ok=True)
-        
-        has_secret = False
-        if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip().startswith("SECRET_KEY="):
-                        has_secret = True
-                        break
-        
-        if not has_secret:
-            import secrets
-            with open(env_path, "a", encoding="utf-8") as f:
-                if os.path.exists(env_path) and os.path.getsize(env_path) > 0:
-                    f.write("\n")
-                f.write(f"SECRET_KEY={secrets.token_urlsafe(48)}\n")
-            self.add_log("Generated backend SECRET_KEY in backend/.env", "system")
-
     def run_command(self, cmd, cwd, name=None):
         def worker():
             try:
@@ -105,7 +233,7 @@ class ProcessManager:
                 use_shell = (os.name == 'nt')
                 
                 cmd_to_run = list(cmd)
-                if name in ["Backend", "AI Engine"] and cmd_to_run[0] == "python":
+                if name and self.app_config.services.get(name, {}).get("runtime") == "python":
                     venv_py = os.path.join(cwd, "venv", "bin", "python")
                     if not os.path.exists(venv_py):
                         venv_py = os.path.join(cwd, ".venv", "bin", "python")
@@ -152,25 +280,26 @@ class ProcessManager:
         if status == "RUNNING":
             return {"status": "success", "message": f"{name} is already running."}
         
-        # Build path structure
-        cwd = os.path.join(self.project_dir, name.lower().replace(" ", "_"))
-        if name == "Frontend":
-            cmd = ["npm", "run", "dev"]
-        elif name == "Backend":
-            self.ensure_backend_env()
-            cmd = ["python", "-m", "uvicorn", "main:app", "--port", "8000", "--host", "0.0.0.0"]
-        elif name == "AI Engine":
-            cmd = ["python", "-m", "uvicorn", "main:app", "--port", "8010", "--host", "0.0.0.0"]
-        else:
+        svc = self.app_config.services.get(name)
+        if not svc:
             return {"status": "error", "message": "Unknown service"}
+
+        cwd = svc["path"]
+        cmd = svc["cmd"]
+        
+        # Auto-configure Backend secret keys before start
+        if name == "Backend" and svc.get("runtime") == "python":
+            self.ensure_backend_env()
 
         self.run_command(cmd, cwd, name)
         return {"status": "success", "message": f"Started {name}"}
 
     def stop_service(self, name):
         with self.lock:
-            proc = self.processes.get(name)
-        
+            return self._stop_service_locked(name)
+
+    def _stop_service_locked(self, name):
+        proc = self.processes.get(name)
         if proc:
             try:
                 proc.terminate()
@@ -182,10 +311,33 @@ class ProcessManager:
             except Exception as e:
                 self.add_log(f"Error stopping {name}: {str(e)}", "error")
             
-            with self.lock:
-                self.processes[name] = None
+            self.processes[name] = None
             return {"status": "success", "message": f"Stopped {name}"}
         return {"status": "error", "message": f"{name} was not running."}
+
+    def ensure_backend_env(self):
+        backend_svc = self.app_config.services.get("Backend")
+        if not backend_svc:
+            return
+        
+        env_path = os.path.join(backend_svc["path"], ".env")
+        os.makedirs(os.path.dirname(env_path), exist_ok=True)
+        
+        has_secret = False
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("SECRET_KEY="):
+                        has_secret = True
+                        break
+        
+        if not has_secret:
+            import secrets
+            with open(env_path, "a", encoding="utf-8") as f:
+                if os.path.exists(env_path) and os.path.getsize(env_path) > 0:
+                    f.write("\n")
+                f.write(f"SECRET_KEY={secrets.token_urlsafe(48)}\n")
+            self.add_log("Generated backend SECRET_KEY in backend/.env", "system")
 
     def install_prereqs(self):
         is_termux = os.path.exists("/data/data/com.termux")
@@ -199,29 +351,23 @@ class ProcessManager:
     def install_deps(self):
         def worker():
             use_shell = (os.name == 'nt')
-            # Install Backend packages
-            be_dir = os.path.join(self.project_dir, "backend")
-            if os.path.exists(be_dir):
-                self.add_log("Installing backend requirements...", "system")
-                proc = subprocess.Popen(["python", "-m", "pip", "install", "-r", "requirements.txt"], cwd=be_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
-                proc.wait()
-
-            # Install AI Engine packages
-            ai_dir = os.path.join(self.project_dir, "ai_engine")
-            if os.path.exists(ai_dir):
-                self.add_log("Installing AI Engine requirements...", "system")
-                proc = subprocess.Popen(["python", "-m", "pip", "install", "-r", "requirements.txt"], cwd=ai_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
-                proc.wait()
-
-            # Install Frontend packages
-            fe_dir = os.path.join(self.project_dir, "frontend")
-            if os.path.exists(fe_dir):
-                self.add_log("Installing Frontend dependencies (npm install)...", "system")
-                proc = subprocess.Popen(["npm", "install"], cwd=fe_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
-                proc.wait()
+            
+            for name, svc in self.app_config.services.items():
+                cwd = svc["path"]
+                if svc["runtime"] == "python":
+                    self.add_log(f"Installing python dependencies for {name}...", "system")
+                    req_path = os.path.join(cwd, "requirements.txt")
+                    if os.path.exists(req_path):
+                        proc = subprocess.Popen(["python", "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                        for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
+                        proc.wait()
+                elif svc["runtime"] == "node":
+                    self.add_log(f"Installing npm packages for {name}...", "system")
+                    package_path = os.path.join(cwd, "package.json")
+                    if os.path.exists(package_path):
+                        proc = subprocess.Popen(["npm", "install"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                        for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
+                        proc.wait()
             
             self.add_log("All dependencies installation processes complete.", "system")
 
@@ -285,44 +431,45 @@ class ProcessManager:
                 self.add_log(f"[FAIL] Node.js check: {str(e)}", "error")
 
             # 3. Check Python Imports in active app
-            self.add_log(f"Checking Python libraries in target: {self.project_dir}", "system")
-            test_script = "import sys; import fastapi; import uvicorn; import pydantic; import openai; print('OK: All imports succeeded!')"
-            try:
-                # Determine binary
-                cmd = ["python", "-c", test_script]
-                venv_py = os.path.join(self.project_dir, "backend", "venv", "bin", "python")
-                if not os.path.exists(venv_py):
-                    venv_py = os.path.join(self.project_dir, "backend", ".venv", "bin", "python")
-                if os.path.exists(venv_py):
-                    cmd[0] = venv_py
-                
-                res = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
-                if res.returncode == 0:
-                    self.add_log(f"[OK] Python libraries: {res.stdout.strip()}", "system")
-                else:
-                    self.add_log(f"[FAIL] Python libraries error: {res.stderr.strip()}", "error")
-                    self.add_log("[TIP] Make sure to run '2. App Modules' to install missing requirements.", "system")
-            except Exception as e:
-                self.add_log(f"[FAIL] Python import test failed to run: {str(e)}", "error")
+            for name, svc in self.app_config.services.items():
+                if svc["runtime"] == "python":
+                    self.add_log(f"Checking Python libraries in target folder: {svc['path']}", "system")
+                    test_script = "import sys; import fastapi; import uvicorn; import pydantic; import openai; print('OK: All imports succeeded!')"
+                    try:
+                        cmd = ["python", "-c", test_script]
+                        venv_py = os.path.join(svc["path"], "venv", "bin", "python")
+                        if not os.path.exists(venv_py):
+                            venv_py = os.path.join(svc["path"], ".venv", "bin", "python")
+                        if os.path.exists(venv_py):
+                            cmd[0] = venv_py
+                        
+                        res = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
+                        if res.returncode == 0:
+                            self.add_log(f"[OK] Python libraries ({name}): {res.stdout.strip()}", "system")
+                        else:
+                            self.add_log(f"[FAIL] Python libraries ({name}) error: {res.stderr.strip()}", "error")
+                            self.add_log("[TIP] Make sure to run '2. App Modules' to install missing requirements.", "system")
+                    except Exception as e:
+                        self.add_log(f"[FAIL] Python import test failed to run: {str(e)}", "error")
 
             # 4. Check Frontend Modules
-            fe_dir = os.path.join(self.project_dir, "frontend")
-            if os.path.exists(fe_dir):
-                next_binary = os.path.join(fe_dir, "node_modules", ".bin", "next")
-                if os.path.exists(next_binary) or os.path.exists(next_binary + ".cmd"):
-                    self.add_log("[OK] Frontend Next.js modules found.", "system")
-                else:
-                    self.add_log("[FAIL] Frontend 'node_modules' is missing or incomplete.", "error")
-                    self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
-            else:
-                self.add_log(f"[FAIL] Frontend directory not found at: {fe_dir}", "error")
+            for name, svc in self.app_config.services.items():
+                if svc["runtime"] == "node":
+                    next_binary = os.path.join(svc["path"], "node_modules", ".bin", "next")
+                    if os.path.exists(next_binary) or os.path.exists(next_binary + ".cmd"):
+                        self.add_log(f"[OK] node_modules found for {name}.", "system")
+                    else:
+                        self.add_log(f"[FAIL] node_modules is missing or incomplete for {name}.", "error")
+                        self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
 
             # 5. Check Ports
-            for name, port in PORTS.items():
-                if self.is_port_in_use(port):
-                    self.add_log(f"[INFO] Port {port} ({name}) is CURRENTLY IN USE by an external process.", "system")
-                else:
-                    self.add_log(f"[OK] Port {port} ({name}) is free.", "system")
+            for name, svc in self.app_config.services.items():
+                port = svc.get("port")
+                if port:
+                    if self.is_port_in_use(port):
+                        self.add_log(f"[INFO] Port {port} ({name}) is CURRENTLY IN USE by an external process.", "system")
+                    else:
+                        self.add_log(f"[OK] Port {port} ({name}) is free.", "system")
 
             self.add_log("=== DIAGNOSTICS COMPLETE ===", "system")
 
@@ -365,8 +512,8 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
                 "services": {
                     name: {
                         "status": manager.get_status(name),
-                        "port": PORTS[name]
-                    } for name in PORTS
+                        "port": manager.app_config.services[name].get("port")
+                    } for name in manager.app_config.services
                 }
             }
             self.send_json(data)
@@ -383,17 +530,21 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             return
 
         elif path == "/api/settings":
-            env_path = os.path.join(manager.project_dir, "ai_engine", ".env")
-            env_data = read_env(env_path)
-            response_data = {
-                "AI_ENGINE_MODE": env_data.get("AI_ENGINE_MODE", "GEMINI"),
-                "GOOGLE_API_KEY": env_data.get("GOOGLE_API_KEY", ""),
-                "GEMINI_MODEL": env_data.get("GEMINI_MODEL", "gemini-2.5-flash"),
-                "NVIDIA_API_KEY": env_data.get("NVIDIA_API_KEY", ""),
-                "NVIDIA_MODEL": env_data.get("NVIDIA_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct"),
-                "TAVILY_API_KEY": env_data.get("TAVILY_API_KEY", "")
-            }
-            self.send_json(response_data)
+            # Collect dynamic settings schema
+            schema = []
+            for env_item in manager.app_config.env_keys:
+                key = env_item["key"]
+                folder = env_item["dir"]
+                env_path = os.path.join(folder, ".env")
+                env_data = read_env(env_path)
+                
+                schema.append({
+                    "key": key,
+                    "description": env_item["description"],
+                    "secret": env_item["secret"],
+                    "value": env_data.get(key, "")
+                })
+            self.send_json({"schema": schema})
             return
 
         elif path == "/api/browse":
@@ -441,8 +592,7 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/select_folder":
             folder = body.get("folder")
             if folder and os.path.exists(folder):
-                manager.project_dir = os.path.abspath(folder)
-                manager.add_log(f"Project root folder changed to: {manager.project_dir}", "system")
+                manager.set_project_dir(folder)
                 self.send_json({"status": "success", "message": f"Folder selected: {manager.project_dir}"})
             else:
                 self.send_json({"status": "error", "message": "Invalid directory folder path."}, status=400)
@@ -460,23 +610,28 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/apps/select":
             app_path = body.get("path")
             if app_path and os.path.exists(app_path):
-                for name in PORTS:
-                    manager.stop_service(name)
-                manager.project_dir = os.path.abspath(app_path)
-                manager.add_log(f"Active app switched to: {manager.project_dir}", "system")
+                manager.set_project_dir(app_path)
                 self.send_json({"status": "success", "message": f"Switched to app context at: {manager.project_dir}"})
             else:
                 self.send_json({"status": "error", "message": "App path does not exist."}, status=400)
             return
 
         elif path == "/api/settings":
-            env_path = os.path.join(manager.project_dir, "ai_engine", ".env")
+            # Map key-value entries to their corresponding .env directories
             try:
-                write_env(env_path, body)
-                manager.add_log(f"Saved configuration updates in {env_path}", "system")
-                self.send_json({"status": "success", "message": "Configuration settings saved successfully."})
+                for env_item in manager.app_config.env_keys:
+                    key = env_item["key"]
+                    folder = env_item["dir"]
+                    
+                    if key in body:
+                        val = str(body[key]).strip()
+                        env_path = os.path.join(folder, ".env")
+                        write_env(env_path, {key: val})
+                
+                manager.add_log("Environment configuration sync complete.", "system")
+                self.send_json({"status": "success", "message": "Settings updated successfully."})
             except Exception as e:
-                self.send_json({"status": "error", "message": f"Failed to save settings: {str(e)}"}, status=500)
+                self.send_json({"status": "error", "message": f"Save failed: {str(e)}"}, status=500)
             return
 
         elif path == "/api/diagnose":
@@ -547,7 +702,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
             <div>
                 <h1 class="text-base font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-300">AstroDash Mobile</h1>
-                <p class="text-[10px] text-indigo-400 font-semibold tracking-wider uppercase">Termux Controller</p>
+                <p class="text-[10px] text-indigo-400 font-semibold tracking-wider uppercase">Generic Controller</p>
             </div>
         </div>
         <div class="flex items-center space-x-2">
@@ -578,60 +733,18 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 2. Configuration Settings Card -->
+        <!-- 2. Dynamic Configuration Settings Card -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
             <div class="flex items-center justify-between">
                 <h2 class="text-sm font-bold tracking-wide text-amber-400 uppercase flex items-center gap-1.5">
-                    <i class="fa-solid fa-sliders text-xs"></i> AI Provider Settings
+                    <i class="fa-solid fa-sliders text-xs"></i> App Configurations
                 </h2>
-                <span class="text-[9px] text-slate-500 uppercase font-bold">Config Sync</span>
+                <span class="text-[9px] text-slate-500 uppercase font-bold">Dynamic Env</span>
             </div>
             
-            <div class="space-y-3.5">
-                <div>
-                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">AI Engine Mode</label>
-                    <select id="cfgEngineMode" onchange="toggleConfigFields()" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-indigo-500/50 text-slate-300">
-                        <option value="GEMINI">Google Gemini</option>
-                        <option value="NVIDIA">NVIDIA NIM</option>
-                        <option value="LOCAL">Local LLM (Ollama)</option>
-                        <option value="PERPLEXITY">Perplexity AI</option>
-                        <option value="SARVAM">Sarvam AI</option>
-                    </select>
-                </div>
-
-                <!-- Google Gemini Fields -->
-                <div id="groupGemini" class="space-y-2.5">
-                    <div>
-                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Gemini API Key</label>
-                        <input type="password" id="cfgGoogleKey" placeholder="Enter Google API Key" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
-                    </div>
-                    <div>
-                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Gemini Model</label>
-                        <input type="text" id="cfgGeminiModel" placeholder="gemini-2.5-flash" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
-                    </div>
-                </div>
-
-                <!-- NVIDIA NIM Fields -->
-                <div id="groupNvidia" class="space-y-2.5 hidden">
-                    <div>
-                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">NVIDIA API Key</label>
-                        <input type="password" id="cfgNvidiaKey" placeholder="Enter NVIDIA API Key (nvapi-...)" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
-                    </div>
-                    <div>
-                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">NVIDIA Model</label>
-                        <input type="text" id="cfgNvidiaModel" placeholder="nvidia/llama-3.1-nemotron-70b-instruct" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
-                    </div>
-                </div>
-
-                <!-- Tavily Search API -->
-                <div>
-                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Tavily Search API Key (Optional)</label>
-                    <input type="password" id="cfgTavilyKey" placeholder="Enter Tavily API Key" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
-                </div>
-
-                <button onclick="saveSettings()" class="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-98">
-                    Save Config Settings
-                </button>
+            <div class="space-y-3.5" id="dynamicSettingsForm">
+                <!-- Dynamically generated input fields -->
+                <div class="text-xs text-slate-500 text-center py-4">Scanning configurations...</div>
             </div>
         </section>
 
@@ -732,6 +845,7 @@ HTML_UI = """<!DOCTYPE html>
     <script>
         let currentPath = '';
         let logsLength = 0;
+        let settingsSchema = [];
 
         // Toast Helper
         function showToast(message, type = 'info') {
@@ -924,47 +1038,64 @@ HTML_UI = """<!DOCTYPE html>
                 const res = await fetch('/api/settings');
                 const data = await res.json();
                 
-                document.getElementById('cfgEngineMode').value = data.AI_ENGINE_MODE;
-                document.getElementById('cfgGoogleKey').value = data.GOOGLE_API_KEY;
-                document.getElementById('cfgGeminiModel').value = data.GEMINI_MODEL;
-                document.getElementById('cfgNvidiaKey').value = data.NVIDIA_API_KEY;
-                document.getElementById('cfgNvidiaModel').value = data.NVIDIA_MODEL;
-                document.getElementById('cfgTavilyKey').value = data.TAVILY_API_KEY;
+                settingsSchema = data.schema || [];
+                const form = document.getElementById('dynamicSettingsForm');
+                form.innerHTML = '';
                 
-                toggleConfigFields();
+                if (settingsSchema.length === 0) {
+                    form.innerHTML = '<div class="text-xs text-slate-500 text-center py-4">No configuration variables needed.</div>';
+                    return;
+                }
+
+                settingsSchema.forEach(field => {
+                    const div = document.createElement('div');
+                    div.className = "space-y-1";
+                    
+                    const isSecret = field.secret;
+                    const inputType = isSecret ? "password" : "text";
+                    
+                    div.innerHTML = `
+                        <label class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">${field.key}</label>
+                        <div class="relative flex items-center">
+                            <input type="${inputType}" id="env_${field.key}" value="${field.value}" placeholder="${field.description}" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300 pr-8" />
+                            ${isSecret ? `
+                                <button type="button" onclick="togglePasswordVisibility('env_${field.key}')" class="absolute right-3 text-slate-500 hover:text-slate-300">
+                                    <i class="fa-solid fa-eye text-[10px]"></i>
+                                </button>
+                            ` : ''}
+                        </div>
+                    `;
+                    form.appendChild(div);
+                });
+
+                // Append save button
+                const saveBtn = document.createElement('button');
+                saveBtn.className = "w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-98 mt-2";
+                saveBtn.onclick = saveSettings;
+                saveBtn.textContent = "Save Config Settings";
+                form.appendChild(saveBtn);
+                
             } catch (e) {
                 console.error("Failed to load settings", e);
             }
         }
 
-        function toggleConfigFields() {
-            const mode = document.getElementById('cfgEngineMode').value;
-            const geminiGrp = document.getElementById('groupGemini');
-            const nvidiaGrp = document.getElementById('groupNvidia');
-            
-            if (mode === 'GEMINI') {
-                geminiGrp.classList.remove('hidden');
-                nvidiaGrp.classList.add('hidden');
-            } else if (mode === 'NVIDIA') {
-                geminiGrp.classList.add('hidden');
-                nvidiaGrp.classList.remove('hidden');
+        function togglePasswordVisibility(id) {
+            const el = document.getElementById(id);
+            if (el.type === "password") {
+                el.type = "text";
             } else {
-                geminiGrp.classList.add('hidden');
-                nvidiaGrp.classList.add('hidden');
+                el.type = "password";
             }
         }
 
         async function saveSettings() {
-            const payload = {
-                "AI_ENGINE_MODE": document.getElementById('cfgEngineMode').value,
-                "GOOGLE_API_KEY": document.getElementById('cfgGoogleKey').value.trim(),
-                "GEMINI_MODEL": document.getElementById('cfgGeminiModel').value.trim(),
-                "NVIDIA_API_KEY": document.getElementById('cfgNvidiaKey').value.trim(),
-                "NVIDIA_MODEL": document.getElementById('cfgNvidiaModel').value.trim(),
-                "TAVILY_API_KEY": document.getElementById('cfgTavilyKey').value.trim()
-            };
+            const payload = {};
+            settingsSchema.forEach(field => {
+                payload[field.key] = document.getElementById(`env_${field.key}`).value.trim();
+            });
             
-            showToast("Saving settings configuration...", "info");
+            showToast("Saving environment settings...", "info");
             try {
                 const res = await fetch('/api/settings', {
                     method: 'POST',
@@ -974,6 +1105,7 @@ HTML_UI = """<!DOCTYPE html>
                 const data = await res.json();
                 if (data.status === 'success') {
                     showToast(data.message, 'success');
+                    loadSettings();
                 } else {
                     showToast(data.message, 'error');
                 }
@@ -1045,8 +1177,14 @@ HTML_UI = """<!DOCTYPE html>
 
                 const grid = document.getElementById('servicesGrid');
                 grid.innerHTML = '';
+                
+                const services = Object.keys(data.services);
+                if (services.length === 0) {
+                    grid.innerHTML = '<div class="text-xs text-slate-500 text-center py-4 bg-white/5 border border-white/5 rounded-xl">No services detected in this app context.</div>';
+                    return;
+                }
 
-                Object.keys(data.services).forEach(name => {
+                services.forEach(name => {
                     const svc = data.services[name];
                     const isRunning = svc.status === 'RUNNING';
                     const isBusy = svc.status === 'BUSY (EXTERNAL)';
@@ -1080,7 +1218,7 @@ HTML_UI = """<!DOCTYPE html>
                                 <div>
                                     <h3 class="text-sm font-bold font-mono tracking-wide">${name}</h3>
                                     <span class="inline-block mt-0.5 px-2 py-0.5 border rounded-md text-[9px] font-bold ${statusClass}">
-                                        ${statusLabel}
+                                        ${statusLabel} ${svc.port ? `(:${svc.port})` : ''}
                                     </span>
                                 </div>
                             </div>
@@ -1170,7 +1308,7 @@ def start_server():
             local_ip = get_ip_address()
             
             print("="*60)
-            print(" ASTRODASH TERMUX WEB LAUNCHER ACTIVE")
+            print(" BYO-AGENT TERMUX WEB LAUNCHER ACTIVE")
             print("="*60)
             print(f" Local Loopback Address:  http://localhost:{server_port}")
             print(f" Mobile Network Link:    http://{local_ip}:{server_port}")
@@ -1192,6 +1330,6 @@ if __name__ == "__main__":
         start_server()
     except KeyboardInterrupt:
         print("\n[!] Shutting down launcher web controller server. Clearing running processes...")
-        for name in PORTS:
+        for name in list(manager.processes.keys()):
             manager.stop_service(name)
         sys.exit(0)
