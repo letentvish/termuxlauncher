@@ -11,6 +11,13 @@ import urllib.parse
 import traceback
 import shutil
 
+# Default configuration ports
+PORTS = {
+    "Frontend": 3000,
+    "Backend": 8000,
+    "AI Engine": 8010
+}
+
 def read_env(filepath):
     values = {}
     if os.path.exists(filepath):
@@ -179,7 +186,6 @@ class ProcessManager:
         self.apps_dir = os.path.join(self.launcher_dir, "apps")
         os.makedirs(self.apps_dir, exist_ok=True)
         
-        # Default to launcher directory
         self.project_dir = os.path.abspath(self.launcher_dir)
         self.app_config = AppConfig(self.project_dir)
         
@@ -187,7 +193,6 @@ class ProcessManager:
 
     def set_project_dir(self, path):
         with self.lock:
-            # Stop existing processes
             for name in list(self.processes.keys()):
                 self._stop_service_locked(name)
             
@@ -275,6 +280,25 @@ class ProcessManager:
         t = threading.Thread(target=worker, daemon=True)
         t.start()
 
+    def ensure_nextjs_swc_fix(self, frontend_path):
+        # Auto-apply Next.js SWC bugfix for Android/Termux (Fails to load rust native swc binary)
+        is_termux = os.path.exists("/data/data/com.termux")
+        if not is_termux:
+            return
+        
+        babelrc = os.path.join(frontend_path, ".babelrc")
+        babel_js = os.path.join(frontend_path, "babel.config.js")
+        
+        if not os.path.exists(babelrc) and not os.path.exists(babel_js):
+            try:
+                with open(babelrc, "w", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "presets": ["next/babel"]
+                    }, indent=2))
+                self.add_log("Created .babelrc in frontend folder to opt-out of SWC and fall back to Babel (Android bypass).", "system")
+            except Exception as e:
+                self.add_log(f"Warning: Failed to auto-create .babelrc: {str(e)}", "error")
+
     def start_service(self, name):
         status = self.get_status(name)
         if status == "RUNNING":
@@ -287,9 +311,10 @@ class ProcessManager:
         cwd = svc["path"]
         cmd = svc["cmd"]
         
-        # Auto-configure Backend secret keys before start
         if name == "Backend" and svc.get("runtime") == "python":
             self.ensure_backend_env()
+        elif name == "Frontend" and svc.get("runtime") == "node":
+            self.ensure_nextjs_swc_fix(cwd)
 
         self.run_command(cmd, cwd, name)
         return {"status": "success", "message": f"Started {name}"}
@@ -530,7 +555,6 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             return
 
         elif path == "/api/settings":
-            # Collect dynamic settings schema
             schema = []
             for env_item in manager.app_config.env_keys:
                 key = env_item["key"]
@@ -617,7 +641,6 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             return
 
         elif path == "/api/settings":
-            # Map key-value entries to their corresponding .env directories
             try:
                 for env_item in manager.app_config.env_keys:
                     key = env_item["key"]
@@ -1068,9 +1091,8 @@ HTML_UI = """<!DOCTYPE html>
                     form.appendChild(div);
                 });
 
-                // Append save button
                 const saveBtn = document.createElement('button');
-                saveBtn.className = "w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-98 mt-2";
+                saveBtn.className = "w-full py-2.5 bg-indigo-650 hover:bg-indigo-600 border border-indigo-500/20 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-98 mt-2";
                 saveBtn.onclick = saveSettings;
                 saveBtn.textContent = "Save Config Settings";
                 form.appendChild(saveBtn);
