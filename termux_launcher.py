@@ -27,7 +27,10 @@ class ProcessManager:
         }
         self.logs = []
         self.lock = threading.Lock()
-        self.project_dir = os.path.dirname(os.path.abspath(__file__))
+        self.launcher_dir = os.path.dirname(os.path.abspath(__file__))
+        self.apps_dir = os.path.join(self.launcher_dir, "apps")
+        os.makedirs(self.apps_dir, exist_ok=True)
+        self.project_dir = os.path.abspath(self.launcher_dir)
         self.log_limit = 1000
 
     def add_log(self, text, stream="system"):
@@ -191,6 +194,44 @@ class ProcessManager:
         t.start()
         return {"status": "success", "message": "Triggered pip & npm installation scripts."}
 
+    def list_apps(self):
+        apps = [{
+            "name": "Default (Local)",
+            "path": self.launcher_dir,
+            "is_active": (self.project_dir == self.launcher_dir)
+        }]
+        if os.path.exists(self.apps_dir):
+            for item in sorted(os.listdir(self.apps_dir)):
+                full_path = os.path.join(self.apps_dir, item)
+                if os.path.isdir(full_path):
+                    # Exclude venv folders if cloned there
+                    if item.startswith('.') or item == '__pycache__':
+                        continue
+                    apps.append({
+                        "name": item,
+                        "path": full_path,
+                        "is_active": (self.project_dir == full_path)
+                    })
+        return apps
+
+    def clone_app(self, repo_url):
+        # Extract repo name from URL (e.g., https://github.com/user/repo -> repo)
+        url_path = urllib.parse.urlparse(repo_url).path
+        repo_name = url_path.strip("/").split("/")[-1]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
+        
+        if not repo_name:
+            return {"status": "error", "message": "Could not determine repository name from URL."}
+        
+        dest_dir = os.path.join(self.apps_dir, repo_name)
+        if os.path.exists(dest_dir):
+            return {"status": "error", "message": f"App '{repo_name}' already exists in library."}
+        
+        cmd = ["git", "clone", repo_url, dest_dir]
+        self.run_command(cmd, self.launcher_dir)
+        return {"status": "success", "message": f"Started cloning {repo_name}..."}
+
 # Initialize global process manager
 manager = ProcessManager()
 
@@ -237,6 +278,10 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             with manager.lock:
                 logs_copy = list(manager.logs)
             self.send_json({"logs": logs_copy})
+            return
+
+        elif path == "/api/apps":
+            self.send_json({"apps": manager.list_apps()})
             return
 
         elif path == "/api/browse":
@@ -292,6 +337,28 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"status": "success", "message": f"Folder selected: {manager.project_dir}"})
             else:
                 self.send_json({"status": "error", "message": "Invalid directory folder path."}, status=400)
+            return
+
+        elif path == "/api/apps/clone":
+            repo_url = body.get("repo_url", "").strip()
+            if not repo_url:
+                self.send_json({"status": "error", "message": "Repo URL is required."}, status=400)
+                return
+            res = manager.clone_app(repo_url)
+            self.send_json(res)
+            return
+
+        elif path == "/api/apps/select":
+            app_path = body.get("path")
+            if app_path and os.path.exists(app_path):
+                # Stop existing running services before switching
+                for name in PORTS:
+                    manager.stop_service(name)
+                manager.project_dir = os.path.abspath(app_path)
+                manager.add_log(f"Active app switched to: {manager.project_dir}", "system")
+                self.send_json({"status": "success", "message": f"Switched to app context at: {manager.project_dir}"})
+            else:
+                self.send_json({"status": "error", "message": "App path does not exist."}, status=400)
             return
 
         elif path == "/api/start":
@@ -371,14 +438,32 @@ HTML_UI = """<!DOCTYPE html>
     <!-- Main Container -->
     <main class="max-w-md mx-auto px-4 mt-6 space-y-6">
 
-        <!-- 1. Folder Selection Card -->
+        <!-- 1. App Library & GitHub Cloning Card -->
+        <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
+            <h2 class="text-sm font-bold tracking-wide text-cyan-300 uppercase flex items-center gap-1.5">
+                <i class="fa-solid fa-square-rss text-xs"></i> App Library
+            </h2>
+            <div class="space-y-3">
+                <div class="flex gap-2">
+                    <input type="text" id="repoUrlInput" placeholder="Paste GitHub Repository URL" class="flex-1 bg-black/20 border border-white/5 rounded-xl px-4 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 transition-all font-mono" />
+                    <button onclick="cloneApp()" class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-95">
+                        Import
+                    </button>
+                </div>
+                <div class="space-y-2 mt-2 max-h-48 overflow-y-auto custom-scrollbar" id="appListContainer">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+        </section>
+
+        <!-- 2. Folder Selection Card (Advanced) -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
             <div class="flex items-center justify-between">
                 <h2 class="text-sm font-bold tracking-wide text-indigo-300 uppercase flex items-center gap-1.5">
-                    <i class="fa-solid fa-folder-open text-xs"></i> Project Directory
+                    <i class="fa-solid fa-folder-open text-xs"></i> Active Path Context
                 </h2>
-                <button onclick="toggleFolderModal(true)" class="text-xs px-2.5 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-slate-300 transition-colors">
-                    <i class="fa-solid fa-search mr-1"></i> Browse
+                <button onclick="toggleFolderModal(true)" class="text-[10px] px-2 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-slate-300 transition-colors">
+                    <i class="fa-solid fa-search mr-1"></i> Browse Local
                 </button>
             </div>
             <div class="p-3 bg-black/30 border border-white/5 rounded-xl flex items-center justify-between text-xs overflow-hidden">
@@ -387,7 +472,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 2. Services Management -->
+        <!-- 3. Services Management -->
         <section class="space-y-3">
             <h2 class="text-xs font-bold tracking-widest text-slate-400 uppercase px-1">Active Port Channels</h2>
             
@@ -396,13 +481,13 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 3. Setup Commands Pipeline -->
+        <!-- 4. Setup Commands Pipeline -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
             <h2 class="text-sm font-bold tracking-wide text-purple-300 uppercase flex items-center gap-1.5">
                 <i class="fa-solid fa-gears text-xs"></i> Installation Pipeline
             </h2>
             <p class="text-xs text-slate-400 leading-relaxed">
-                If configuring the application for the first time in Termux, execute the stages sequentially to register system dependencies.
+                Run stages sequentially to configure dependencies for the currently active app.
             </p>
             <div class="grid grid-cols-2 gap-3 pt-1">
                 <button onclick="triggerSetup('install_prereqs')" class="p-3 bg-slate-900 border border-white/15 hover:border-indigo-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
@@ -418,7 +503,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 4. Terminal Log Output -->
+        <!-- 5. Terminal Log Output -->
         <section class="bg-black/40 border border-white/15 rounded-2xl p-5 shadow-2xl space-y-4">
             <div class="flex items-center justify-between">
                 <h2 class="text-sm font-bold tracking-wide text-amber-300 uppercase flex items-center gap-1.5">
@@ -555,11 +640,100 @@ HTML_UI = """<!DOCTYPE html>
                     showToast(data.message, 'success');
                     toggleFolderModal(false);
                     fetchStatus();
+                    fetchApps();
                 } else {
                     showToast(data.message, 'error');
                 }
             } catch (e) {
                 showToast("Request failed", 'error');
+            }
+        }
+
+        // App Management UI
+        async function fetchApps() {
+            try {
+                const res = await fetch('/api/apps');
+                const data = await res.json();
+                
+                const list = document.getElementById('appListContainer');
+                list.innerHTML = '';
+                
+                if (data.apps.length === 0) {
+                    list.innerHTML = '<div class="text-xs text-slate-500 text-center py-2">No apps imported yet.</div>';
+                    return;
+                }
+
+                data.apps.forEach(app => {
+                    const row = document.createElement('div');
+                    row.className = `flex items-center justify-between p-3 rounded-xl border text-xs transition-colors ${
+                        app.is_active ? 'bg-indigo-650/15 border-indigo-500/30' : 'bg-slate-900 border-white/5 hover:border-white/10'
+                    }`;
+                    
+                    row.innerHTML = `
+                        <div class="flex items-center space-x-2 min-w-0">
+                            <i class="fa-solid ${app.name.includes('Local') ? 'fa-house-laptop text-indigo-400' : 'fa-mobile-screen-button text-cyan-400'} text-xs"></i>
+                            <span class="font-bold truncate text-[11px]">${app.name}</span>
+                        </div>
+                        <button onclick="selectApp('${app.path}')" class="px-3 py-1.5 rounded-lg text-[10px] font-bold shadow-md transition-all active:scale-95 ${
+                            app.is_active ? 'bg-emerald-600 text-white cursor-default' : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
+                        }" ${app.is_active ? 'disabled' : ''}>
+                            ${app.is_active ? 'Active' : 'Launch'}
+                        </button>
+                    `;
+                    list.appendChild(row);
+                });
+            } catch (e) {
+                console.error("Failed to load apps", e);
+            }
+        }
+
+        async function cloneApp() {
+            const urlInput = document.getElementById('repoUrlInput');
+            const repoUrl = urlInput.value.trim();
+            if (!repoUrl) {
+                showToast("Please enter a valid git repo URL", "error");
+                return;
+            }
+            
+            showToast("Cloning repository from GitHub...", "info");
+            urlInput.value = '';
+            
+            try {
+                const res = await fetch('/api/apps/clone', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ repo_url: repoUrl })
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    showToast(data.message, 'success');
+                    fetchApps();
+                } else {
+                    showToast(data.message, 'error');
+                }
+            } catch (e) {
+                showToast("Cloning command failed", "error");
+            }
+        }
+
+        async function selectApp(path) {
+            showToast("Activating selected app...", "info");
+            try {
+                const res = await fetch('/api/apps/select', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: path })
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    showToast(data.message, 'success');
+                    fetchApps();
+                    fetchStatus();
+                } else {
+                    showToast(data.message, 'error');
+                }
+            } catch (e) {
+                showToast("Failed to switch app", "error");
             }
         }
 
@@ -709,7 +883,9 @@ HTML_UI = """<!DOCTYPE html>
 
         // Init
         fetchStatus();
+        fetchApps();
         setInterval(fetchStatus, 3000);
+        setInterval(fetchApps, 6000);
         setInterval(fetchLogs, 1500);
     </script>
 </body>
@@ -719,7 +895,6 @@ HTML_UI = """<!DOCTYPE html>
 def get_ip_address():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Doesn't need to connect, just resolves local route
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
@@ -744,7 +919,6 @@ def start_server():
             print(" Press Ctrl+C to shutdown.")
             print("="*60)
             
-            # Start background monitoring loops if needed
             server.serve_forever()
             break
         except OSError as e:
@@ -759,7 +933,6 @@ if __name__ == "__main__":
         start_server()
     except KeyboardInterrupt:
         print("\n[!] Shutting down launcher web controller server. Clearing running processes...")
-        # Kill all running subprocesses
         for name in PORTS:
             manager.stop_service(name)
         sys.exit(0)
