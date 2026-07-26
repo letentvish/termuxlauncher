@@ -18,6 +18,25 @@ PORTS = {
     "AI Engine": 8010
 }
 
+def read_env(filepath):
+    values = {}
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    values[k.strip()] = v.strip()
+    return values
+
+def write_env(filepath, new_values):
+    values = read_env(filepath)
+    values.update(new_values)
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        for k, v in sorted(values.items()):
+            f.write(f"{k}={v}\n")
+
 class ProcessManager:
     def __init__(self):
         self.processes = {
@@ -59,6 +78,26 @@ class ProcessManager:
             return "BUSY (EXTERNAL)"
         return "STOPPED"
 
+    def ensure_backend_env(self):
+        env_path = os.path.join(self.project_dir, "backend", ".env")
+        os.makedirs(os.path.dirname(env_path), exist_ok=True)
+        
+        has_secret = False
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("SECRET_KEY="):
+                        has_secret = True
+                        break
+        
+        if not has_secret:
+            import secrets
+            with open(env_path, "a", encoding="utf-8") as f:
+                if os.path.exists(env_path) and os.path.getsize(env_path) > 0:
+                    f.write("\n")
+                f.write(f"SECRET_KEY={secrets.token_urlsafe(48)}\n")
+            self.add_log("Generated backend SECRET_KEY in backend/.env", "system")
+
     def run_command(self, cmd, cwd, name=None):
         def worker():
             try:
@@ -68,7 +107,6 @@ class ProcessManager:
                 # Check for virtual environment inside backend or ai_engine
                 cmd_to_run = list(cmd)
                 if name in ["Backend", "AI Engine"] and cmd_to_run[0] == "python":
-                    # Check for local venv
                     venv_py = os.path.join(cwd, "venv", "bin", "python")
                     if not os.path.exists(venv_py):
                         venv_py = os.path.join(cwd, ".venv", "bin", "python")
@@ -91,7 +129,6 @@ class ProcessManager:
                     with self.lock:
                         self.processes[name] = process
                 
-                # Stream logs
                 for line in iter(process.stdout.readline, ''):
                     self.add_log(line.strip(), name.lower() if name else "setup")
                 
@@ -121,6 +158,8 @@ class ProcessManager:
         if name == "Frontend":
             cmd = ["npm", "run", "dev"]
         elif name == "Backend":
+            # Ensure backend env is set up (generates SECRET_KEY)
+            self.ensure_backend_env()
             # Bind to 0.0.0.0 for LAN/mobile testing
             cmd = ["python", "-m", "uvicorn", "main:app", "--port", "8000", "--host", "0.0.0.0"]
         elif name == "AI Engine":
@@ -152,14 +191,14 @@ class ProcessManager:
         return {"status": "error", "message": f"{name} was not running."}
 
     def install_prereqs(self):
-        # Determine packages based on termux environment
         is_termux = os.path.exists("/data/data/com.termux")
         if not is_termux:
-            return {"status": "error", "message": "This operation is optimized for Termux. Please install python, git, and nodejs manually on your system."}
+            return {"status": "error", "message": "This operation is optimized for Termux. Please install build libraries manually on your system."}
         
-        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "tur-repo"]
+        # Install build dependencies for compiling Python packages (Pydantic, Cryptography)
+        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "rust", "tur-repo"]
         self.run_command(cmd, self.project_dir)
-        return {"status": "success", "message": "Triggered Termux packages installation."}
+        return {"status": "success", "message": "Triggered Termux build dependencies installation."}
 
     def install_deps(self):
         def worker():
@@ -168,7 +207,7 @@ class ProcessManager:
             be_dir = os.path.join(self.project_dir, "backend")
             if os.path.exists(be_dir):
                 self.add_log("Installing backend requirements...", "system")
-                proc = subprocess.Popen(["pip", "install", "-r", "requirements.txt"], cwd=be_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                proc = subprocess.Popen(["python", "-m", "pip", "install", "-r", "requirements.txt"], cwd=be_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                 for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                 proc.wait()
 
@@ -176,7 +215,7 @@ class ProcessManager:
             ai_dir = os.path.join(self.project_dir, "ai_engine")
             if os.path.exists(ai_dir):
                 self.add_log("Installing AI Engine requirements...", "system")
-                proc = subprocess.Popen(["pip", "install", "-r", "requirements.txt"], cwd=ai_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                proc = subprocess.Popen(["python", "-m", "pip", "install", "-r", "requirements.txt"], cwd=ai_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                 for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                 proc.wait()
 
@@ -204,7 +243,6 @@ class ProcessManager:
             for item in sorted(os.listdir(self.apps_dir)):
                 full_path = os.path.join(self.apps_dir, item)
                 if os.path.isdir(full_path):
-                    # Exclude venv folders if cloned there
                     if item.startswith('.') or item == '__pycache__':
                         continue
                     apps.append({
@@ -215,7 +253,6 @@ class ProcessManager:
         return apps
 
     def clone_app(self, repo_url):
-        # Extract repo name from URL (e.g., https://github.com/user/repo -> repo)
         url_path = urllib.parse.urlparse(repo_url).path
         repo_name = url_path.strip("/").split("/")[-1]
         if repo_name.endswith(".git"):
@@ -237,7 +274,7 @@ manager = ProcessManager()
 
 class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass # Suppress command line logging of requests to keep console clean
+        pass 
 
     def end_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -284,6 +321,21 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"apps": manager.list_apps()})
             return
 
+        elif path == "/api/settings":
+            env_path = os.path.join(manager.project_dir, "ai_engine", ".env")
+            env_data = read_env(env_path)
+            # Default empty strings for UI safety
+            response_data = {
+                "AI_ENGINE_MODE": env_data.get("AI_ENGINE_MODE", "GEMINI"),
+                "GOOGLE_API_KEY": env_data.get("GOOGLE_API_KEY", ""),
+                "GEMINI_MODEL": env_data.get("GEMINI_MODEL", "gemini-2.5-flash"),
+                "NVIDIA_API_KEY": env_data.get("NVIDIA_API_KEY", ""),
+                "NVIDIA_MODEL": env_data.get("NVIDIA_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct"),
+                "TAVILY_API_KEY": env_data.get("TAVILY_API_KEY", "")
+            }
+            self.send_json(response_data)
+            return
+
         elif path == "/api/browse":
             target_path = query.get('path', [os.path.expanduser("~")])[0]
             try:
@@ -291,14 +343,12 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
                     target_path = os.path.expanduser("~")
                 
                 items = []
-                # Add parent directory
                 parent = os.path.dirname(target_path)
                 if parent != target_path:
                     items.append({"name": "..", "path": parent, "is_dir": True})
 
                 for f in sorted(os.listdir(target_path)):
                     full_p = os.path.join(target_path, f)
-                    # Skip hidden items except in venv
                     if f.startswith('.') and f != '.env':
                         continue
                     items.append({
@@ -315,7 +365,6 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": str(e)}, status=500)
             return
 
-        # Serve static assets or fall back
         self.send_error(404, "Not Found")
 
     def do_POST(self):
@@ -351,7 +400,6 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/apps/select":
             app_path = body.get("path")
             if app_path and os.path.exists(app_path):
-                # Stop existing running services before switching
                 for name in PORTS:
                     manager.stop_service(name)
                 manager.project_dir = os.path.abspath(app_path)
@@ -359,6 +407,16 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"status": "success", "message": f"Switched to app context at: {manager.project_dir}"})
             else:
                 self.send_json({"status": "error", "message": "App path does not exist."}, status=400)
+            return
+
+        elif path == "/api/settings":
+            env_path = os.path.join(manager.project_dir, "ai_engine", ".env")
+            try:
+                write_env(env_path, body)
+                manager.add_log(f"Saved configuration updates in {env_path}", "system")
+                self.send_json({"status": "success", "message": "Configuration settings saved successfully."})
+            except Exception as e:
+                self.send_json({"status": "error", "message": f"Failed to save settings: {str(e)}"}, status=500)
             return
 
         elif path == "/api/start":
@@ -456,7 +514,64 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 2. Folder Selection Card (Advanced) -->
+        <!-- 2. Configuration Settings Card -->
+        <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
+            <div class="flex items-center justify-between">
+                <h2 class="text-sm font-bold tracking-wide text-amber-400 uppercase flex items-center gap-1.5">
+                    <i class="fa-solid fa-sliders text-xs"></i> AI Provider Settings
+                </h2>
+                <span class="text-[9px] text-slate-500 uppercase font-bold">Config Sync</span>
+            </div>
+            
+            <div class="space-y-3.5">
+                <div>
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">AI Engine Mode</label>
+                    <select id="cfgEngineMode" onchange="toggleConfigFields()" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-indigo-500/50 text-slate-300">
+                        <option value="GEMINI">Google Gemini</option>
+                        <option value="NVIDIA">NVIDIA NIM</option>
+                        <option value="LOCAL">Local LLM (Ollama)</option>
+                        <option value="PERPLEXITY">Perplexity AI</option>
+                        <option value="SARVAM">Sarvam AI</option>
+                    </select>
+                </div>
+
+                <!-- Google Gemini Fields -->
+                <div id="groupGemini" class="space-y-2.5">
+                    <div>
+                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Gemini API Key</label>
+                        <input type="password" id="cfgGoogleKey" placeholder="Enter Google API Key" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
+                    </div>
+                    <div>
+                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Gemini Model</label>
+                        <input type="text" id="cfgGeminiModel" placeholder="gemini-2.5-flash" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
+                    </div>
+                </div>
+
+                <!-- NVIDIA NIM Fields -->
+                <div id="groupNvidia" class="space-y-2.5 hidden">
+                    <div>
+                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">NVIDIA API Key</label>
+                        <input type="password" id="cfgNvidiaKey" placeholder="Enter NVIDIA API Key (nvapi-...)" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
+                    </div>
+                    <div>
+                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">NVIDIA Model</label>
+                        <input type="text" id="cfgNvidiaModel" placeholder="nvidia/llama-3.1-nemotron-70b-instruct" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
+                    </div>
+                </div>
+
+                <!-- Tavily Search API -->
+                <div>
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Tavily Search API Key (Optional)</label>
+                    <input type="password" id="cfgTavilyKey" placeholder="Enter Tavily API Key" class="w-full bg-black/20 border border-white/5 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 font-mono text-slate-300" />
+                </div>
+
+                <button onclick="saveSettings()" class="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-98">
+                    Save Config Settings
+                </button>
+            </div>
+        </section>
+
+        <!-- 3. Folder Selection Card (Advanced) -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
             <div class="flex items-center justify-between">
                 <h2 class="text-sm font-bold tracking-wide text-indigo-300 uppercase flex items-center gap-1.5">
@@ -472,7 +587,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 3. Services Management -->
+        <!-- 4. Services Management -->
         <section class="space-y-3">
             <h2 class="text-xs font-bold tracking-widest text-slate-400 uppercase px-1">Active Port Channels</h2>
             
@@ -481,7 +596,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 4. Setup Commands Pipeline -->
+        <!-- 5. Setup Commands Pipeline -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
             <h2 class="text-sm font-bold tracking-wide text-purple-300 uppercase flex items-center gap-1.5">
                 <i class="fa-solid fa-gears text-xs"></i> Installation Pipeline
@@ -503,7 +618,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 5. Terminal Log Output -->
+        <!-- 6. Terminal Log Output -->
         <section class="bg-black/40 border border-white/15 rounded-2xl p-5 shadow-2xl space-y-4">
             <div class="flex items-center justify-between">
                 <h2 class="text-sm font-bold tracking-wide text-amber-300 uppercase flex items-center gap-1.5">
@@ -641,6 +756,7 @@ HTML_UI = """<!DOCTYPE html>
                     toggleFolderModal(false);
                     fetchStatus();
                     fetchApps();
+                    loadSettings();
                 } else {
                     showToast(data.message, 'error');
                 }
@@ -729,11 +845,76 @@ HTML_UI = """<!DOCTYPE html>
                     showToast(data.message, 'success');
                     fetchApps();
                     fetchStatus();
+                    loadSettings();
                 } else {
                     showToast(data.message, 'error');
                 }
             } catch (e) {
                 showToast("Failed to switch app", "error");
+            }
+        }
+
+        // Settings Handling
+        async function loadSettings() {
+            try {
+                const res = await fetch('/api/settings');
+                const data = await res.json();
+                
+                document.getElementById('cfgEngineMode').value = data.AI_ENGINE_MODE;
+                document.getElementById('cfgGoogleKey').value = data.GOOGLE_API_KEY;
+                document.getElementById('cfgGeminiModel').value = data.GEMINI_MODEL;
+                document.getElementById('cfgNvidiaKey').value = data.NVIDIA_API_KEY;
+                document.getElementById('cfgNvidiaModel').value = data.NVIDIA_MODEL;
+                document.getElementById('cfgTavilyKey').value = data.TAVILY_API_KEY;
+                
+                toggleConfigFields();
+            } catch (e) {
+                console.error("Failed to load settings", e);
+            }
+        }
+
+        function toggleConfigFields() {
+            const mode = document.getElementById('cfgEngineMode').value;
+            const geminiGrp = document.getElementById('groupGemini');
+            const nvidiaGrp = document.getElementById('groupNvidia');
+            
+            if (mode === 'GEMINI') {
+                geminiGrp.classList.remove('hidden');
+                nvidiaGrp.classList.add('hidden');
+            } else if (mode === 'NVIDIA') {
+                geminiGrp.classList.add('hidden');
+                nvidiaGrp.classList.remove('hidden');
+            } else {
+                geminiGrp.classList.add('hidden');
+                nvidiaGrp.classList.add('hidden');
+            }
+        }
+
+        async function saveSettings() {
+            const payload = {
+                "AI_ENGINE_MODE": document.getElementById('cfgEngineMode').value,
+                "GOOGLE_API_KEY": document.getElementById('cfgGoogleKey').value.trim(),
+                "GEMINI_MODEL": document.getElementById('cfgGeminiModel').value.trim(),
+                "NVIDIA_API_KEY": document.getElementById('cfgNvidiaKey').value.trim(),
+                "NVIDIA_MODEL": document.getElementById('cfgNvidiaModel').value.trim(),
+                "TAVILY_API_KEY": document.getElementById('cfgTavilyKey').value.trim()
+            };
+            
+            showToast("Saving settings configuration...", "info");
+            try {
+                const res = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    showToast(data.message, 'success');
+                } else {
+                    showToast(data.message, 'error');
+                }
+            } catch (e) {
+                showToast("Failed to save settings", "error");
             }
         }
 
@@ -810,7 +991,6 @@ HTML_UI = """<!DOCTYPE html>
                         isRunning ? 'bg-indigo-950/10 border-indigo-500/20 shadow-lg shadow-indigo-500/5' : 'bg-white/5 border-white/10'
                     }`;
 
-                    // Auto-resolve hostname for links to make opening apps in mobile convenient
                     const hostname = window.location.hostname;
                     const url = name === 'Backend' ? `http://${hostname}:${svc.port}/docs` : `http://${hostname}:${svc.port}`;
 
@@ -868,7 +1048,6 @@ HTML_UI = """<!DOCTYPE html>
                     });
 
                     logsLength = data.logs.length;
-                    // Auto scroll
                     terminal.scrollTop = terminal.scrollHeight;
                 }
             } catch (e) {
@@ -884,6 +1063,7 @@ HTML_UI = """<!DOCTYPE html>
         // Init
         fetchStatus();
         fetchApps();
+        loadSettings();
         setInterval(fetchStatus, 3000);
         setInterval(fetchApps, 6000);
         setInterval(fetchLogs, 1500);
