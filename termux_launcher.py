@@ -289,7 +289,6 @@ class ProcessManager:
         )
 
     def ensure_nextjs_swc_fix(self, frontend_path):
-        # Auto-apply Next.js SWC bugfix for Android/Termux (Fails to load rust native swc binary)
         if not self.is_android_termux():
             return
         
@@ -387,12 +386,33 @@ class ProcessManager:
             for name, svc in self.app_config.services.items():
                 cwd = svc["path"]
                 if svc["runtime"] == "python":
-                    self.add_log(f"Installing python dependencies for {name}...", "system")
+                    self.add_log(f"Setting up Python virtual environment for {name}...", "system")
+                    
+                    venv_dir = os.path.join(cwd, ".venv")
+                    if not os.path.exists(venv_dir):
+                        try:
+                            self.add_log(f"Creating venv in {venv_dir}...", "system")
+                            proc_venv = subprocess.Popen(["python", "-m", "venv", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            for line in iter(proc_venv.stdout.readline, ''): self.add_log(line.strip(), "setup")
+                            proc_venv.wait()
+                        except Exception as e:
+                            self.add_log(f"Venv creation failed: {str(e)}", "error")
+                    
+                    venv_py = os.path.join(venv_dir, "bin", "python")
+                    if os.name == 'nt':
+                        venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
+                    
+                    if not os.path.exists(venv_py):
+                        venv_py = "python"
+                        self.add_log("Venv python not found, falling back to system Python.", "error")
+                    
+                    self.add_log(f"Installing python dependencies in venv using {venv_py}...", "system")
                     req_path = os.path.join(cwd, "requirements.txt")
                     if os.path.exists(req_path):
-                        proc = subprocess.Popen(["python", "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                        proc = subprocess.Popen([venv_py, "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                         for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                         proc.wait()
+                        
                 elif svc["runtime"] == "node":
                     self.add_log(f"Installing npm packages for {name}...", "system")
                     package_path = os.path.join(cwd, "package.json")
@@ -401,7 +421,6 @@ class ProcessManager:
                         for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                         proc.wait()
                         
-                        # Termux/Android Specific Fix: Force install compiled SWC arm64 binary package to avoid failed load
                         if self.is_android_termux():
                             self.add_log("Android/Termux detected. Installing native SWC compiler binary for arm64...", "system")
                             proc2 = subprocess.Popen(["npm", "install", "@next/swc-android-arm64", "--save-optional"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
