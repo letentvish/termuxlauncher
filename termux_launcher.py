@@ -104,7 +104,6 @@ class ProcessManager:
                 self.add_log(f"Starting process: {' '.join(cmd)} in {cwd}", "system")
                 use_shell = (os.name == 'nt')
                 
-                # Check for virtual environment inside backend or ai_engine
                 cmd_to_run = list(cmd)
                 if name in ["Backend", "AI Engine"] and cmd_to_run[0] == "python":
                     venv_py = os.path.join(cwd, "venv", "bin", "python")
@@ -158,9 +157,7 @@ class ProcessManager:
         if name == "Frontend":
             cmd = ["npm", "run", "dev"]
         elif name == "Backend":
-            # Ensure backend env is set up (generates SECRET_KEY)
             self.ensure_backend_env()
-            # Bind to 0.0.0.0 for LAN/mobile testing
             cmd = ["python", "-m", "uvicorn", "main:app", "--port", "8000", "--host", "0.0.0.0"]
         elif name == "AI Engine":
             cmd = ["python", "-m", "uvicorn", "main:app", "--port", "8010", "--host", "0.0.0.0"]
@@ -195,7 +192,6 @@ class ProcessManager:
         if not is_termux:
             return {"status": "error", "message": "This operation is optimized for Termux. Please install build libraries manually on your system."}
         
-        # Install build dependencies for compiling Python packages (Pydantic, Cryptography)
         cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "rust", "tur-repo"]
         self.run_command(cmd, self.project_dir)
         return {"status": "success", "message": "Triggered Termux build dependencies installation."}
@@ -269,6 +265,71 @@ class ProcessManager:
         self.run_command(cmd, self.launcher_dir)
         return {"status": "success", "message": f"Started cloning {repo_name}..."}
 
+    def run_diagnostics(self):
+        def worker():
+            self.add_log("=== RUNNING SYSTEM DIAGNOSTICS ===", "system")
+            use_shell = (os.name == 'nt')
+            
+            # 1. Check Python
+            try:
+                res = subprocess.run(["python", "--version"], capture_output=True, text=True, shell=use_shell)
+                self.add_log(f"[OK] Python version: {res.stdout.strip() or res.stderr.strip()}", "system")
+            except Exception as e:
+                self.add_log(f"[FAIL] Python check: {str(e)}", "error")
+
+            # 2. Check Node.js
+            try:
+                res = subprocess.run(["node", "--version"], capture_output=True, text=True, shell=use_shell)
+                self.add_log(f"[OK] Node.js version: {res.stdout.strip() or res.stderr.strip()}", "system")
+            except Exception as e:
+                self.add_log(f"[FAIL] Node.js check: {str(e)}", "error")
+
+            # 3. Check Python Imports in active app
+            self.add_log(f"Checking Python libraries in target: {self.project_dir}", "system")
+            test_script = "import sys; import fastapi; import uvicorn; import pydantic; import openai; print('OK: All imports succeeded!')"
+            try:
+                # Determine binary
+                cmd = ["python", "-c", test_script]
+                venv_py = os.path.join(self.project_dir, "backend", "venv", "bin", "python")
+                if not os.path.exists(venv_py):
+                    venv_py = os.path.join(self.project_dir, "backend", ".venv", "bin", "python")
+                if os.path.exists(venv_py):
+                    cmd[0] = venv_py
+                
+                res = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
+                if res.returncode == 0:
+                    self.add_log(f"[OK] Python libraries: {res.stdout.strip()}", "system")
+                else:
+                    self.add_log(f"[FAIL] Python libraries error: {res.stderr.strip()}", "error")
+                    self.add_log("[TIP] Make sure to run '2. App Modules' to install missing requirements.", "system")
+            except Exception as e:
+                self.add_log(f"[FAIL] Python import test failed to run: {str(e)}", "error")
+
+            # 4. Check Frontend Modules
+            fe_dir = os.path.join(self.project_dir, "frontend")
+            if os.path.exists(fe_dir):
+                next_binary = os.path.join(fe_dir, "node_modules", ".bin", "next")
+                if os.path.exists(next_binary) or os.path.exists(next_binary + ".cmd"):
+                    self.add_log("[OK] Frontend Next.js modules found.", "system")
+                else:
+                    self.add_log("[FAIL] Frontend 'node_modules' is missing or incomplete.", "error")
+                    self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
+            else:
+                self.add_log(f"[FAIL] Frontend directory not found at: {fe_dir}", "error")
+
+            # 5. Check Ports
+            for name, port in PORTS.items():
+                if self.is_port_in_use(port):
+                    self.add_log(f"[INFO] Port {port} ({name}) is CURRENTLY IN USE by an external process.", "system")
+                else:
+                    self.add_log(f"[OK] Port {port} ({name}) is free.", "system")
+
+            self.add_log("=== DIAGNOSTICS COMPLETE ===", "system")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return {"status": "success", "message": "Diagnostic tests started. Check logs below."}
+
 # Initialize global process manager
 manager = ProcessManager()
 
@@ -324,7 +385,6 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/settings":
             env_path = os.path.join(manager.project_dir, "ai_engine", ".env")
             env_data = read_env(env_path)
-            # Default empty strings for UI safety
             response_data = {
                 "AI_ENGINE_MODE": env_data.get("AI_ENGINE_MODE", "GEMINI"),
                 "GOOGLE_API_KEY": env_data.get("GOOGLE_API_KEY", ""),
@@ -419,6 +479,11 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"status": "error", "message": f"Failed to save settings: {str(e)}"}, status=500)
             return
 
+        elif path == "/api/diagnose":
+            res = manager.run_diagnostics()
+            self.send_json(res)
+            return
+
         elif path == "/api/start":
             name = body.get("service")
             res = manager.start_service(name)
@@ -486,10 +551,9 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </div>
         <div class="flex items-center space-x-2">
-            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                <span class="w-1.5 h-1.5 mr-1 rounded-full bg-emerald-500 animate-pulse"></span>
-                Active
-            </span>
+            <button onclick="runDiagnostics()" class="text-[10px] font-bold px-2.5 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all flex items-center gap-1">
+                <i class="fa-solid fa-stethoscope"></i> Check Health
+            </button>
         </div>
     </header>
 
@@ -915,6 +979,21 @@ HTML_UI = """<!DOCTYPE html>
                 }
             } catch (e) {
                 showToast("Failed to save settings", "error");
+            }
+        }
+
+        async function runDiagnostics() {
+            showToast("Running system diagnostics tests...", "info");
+            try {
+                const res = await fetch('/api/diagnose', { method: 'POST' });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    showToast(data.message, 'success');
+                } else {
+                    showToast(data.message, 'error');
+                }
+            } catch (e) {
+                showToast("Failed to execute diagnostic check", "error");
             }
         }
 
