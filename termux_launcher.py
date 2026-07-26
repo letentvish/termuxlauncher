@@ -280,10 +280,17 @@ class ProcessManager:
         t = threading.Thread(target=worker, daemon=True)
         t.start()
 
+    def is_android_termux(self):
+        return (
+            os.path.exists("/data/data/com.termux") or 
+            "PREFIX" in os.environ or 
+            "TERMUX_VERSION" in os.environ or
+            shutil.which("pkg") is not None
+        )
+
     def ensure_nextjs_swc_fix(self, frontend_path):
         # Auto-apply Next.js SWC bugfix for Android/Termux (Fails to load rust native swc binary)
-        is_termux = os.path.exists("/data/data/com.termux")
-        if not is_termux:
+        if not self.is_android_termux():
             return
         
         babelrc = os.path.join(frontend_path, ".babelrc")
@@ -365,7 +372,7 @@ class ProcessManager:
             self.add_log("Generated backend SECRET_KEY in backend/.env", "system")
 
     def install_prereqs(self):
-        is_termux = os.path.exists("/data/data/com.termux")
+        is_termux = self.is_android_termux()
         if not is_termux:
             return {"status": "error", "message": "This operation is optimized for Termux. Please install build libraries manually on your system."}
         
@@ -393,6 +400,13 @@ class ProcessManager:
                         proc = subprocess.Popen(["npm", "install"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                         for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                         proc.wait()
+                        
+                        # Termux/Android Specific Fix: Force install compiled SWC arm64 binary package to avoid failed load
+                        if self.is_android_termux():
+                            self.add_log("Android/Termux detected. Installing native SWC compiler binary for arm64...", "system")
+                            proc2 = subprocess.Popen(["npm", "install", "@next/swc-android-arm64", "--save-optional"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            for line in iter(proc2.stdout.readline, ''): self.add_log(line.strip(), "setup")
+                            proc2.wait()
             
             self.add_log("All dependencies installation processes complete.", "system")
 
@@ -441,21 +455,18 @@ class ProcessManager:
             self.add_log("=== RUNNING SYSTEM DIAGNOSTICS ===", "system")
             use_shell = (os.name == 'nt')
             
-            # 1. Check Python
             try:
                 res = subprocess.run(["python", "--version"], capture_output=True, text=True, shell=use_shell)
                 self.add_log(f"[OK] Python version: {res.stdout.strip() or res.stderr.strip()}", "system")
             except Exception as e:
                 self.add_log(f"[FAIL] Python check: {str(e)}", "error")
 
-            # 2. Check Node.js
             try:
                 res = subprocess.run(["node", "--version"], capture_output=True, text=True, shell=use_shell)
                 self.add_log(f"[OK] Node.js version: {res.stdout.strip() or res.stderr.strip()}", "system")
             except Exception as e:
                 self.add_log(f"[FAIL] Node.js check: {str(e)}", "error")
 
-            # 3. Check Python Imports in active app
             for name, svc in self.app_config.services.items():
                 if svc["runtime"] == "python":
                     self.add_log(f"Checking Python libraries in target folder: {svc['path']}", "system")
@@ -477,7 +488,6 @@ class ProcessManager:
                     except Exception as e:
                         self.add_log(f"[FAIL] Python import test failed to run: {str(e)}", "error")
 
-            # 4. Check Frontend Modules
             for name, svc in self.app_config.services.items():
                 if svc["runtime"] == "node":
                     next_binary = os.path.join(svc["path"], "node_modules", ".bin", "next")
@@ -487,7 +497,6 @@ class ProcessManager:
                         self.add_log(f"[FAIL] node_modules is missing or incomplete for {name}.", "error")
                         self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
 
-            # 5. Check Ports
             for name, svc in self.app_config.services.items():
                 port = svc.get("port")
                 if port:
