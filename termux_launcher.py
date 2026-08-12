@@ -248,13 +248,19 @@ class ProcessManager:
                         cmd_to_run[0] = venv_py
                         self.add_log(f"Using virtual environment python: {venv_py}", "system")
 
+                env = dict(os.environ)
+                if name and self.app_config.services.get(name, {}).get("port"):
+                    env["PORT"] = str(self.app_config.services[name]["port"])
+                env["CI"] = "true"
+
                 process = subprocess.Popen(
                     cmd_to_run,
                     cwd=cwd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    shell=use_shell
+                    shell=use_shell,
+                    env=env
                 )
                 
                 if name:
@@ -305,6 +311,58 @@ class ProcessManager:
             except Exception as e:
                 self.add_log(f"Warning: Failed to auto-create .babelrc: {str(e)}", "error")
 
+    def ensure_frontend_deps(self, frontend_path):
+        self.ensure_nextjs_swc_fix(frontend_path)
+        
+        node_modules = os.path.join(frontend_path, "node_modules")
+        package_json = os.path.join(frontend_path, "package.json")
+        
+        if os.path.exists(package_json) and not os.path.exists(node_modules):
+            self.add_log("node_modules missing in frontend directory. Running npm install automatically...", "system")
+            use_shell = (os.name == 'nt')
+            try:
+                proc = subprocess.Popen(["npm", "install"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                for line in iter(proc.stdout.readline, ''):
+                    self.add_log(line.strip(), "setup")
+                proc.wait()
+            except Exception as e:
+                self.add_log(f"Auto npm install error: {str(e)}", "error")
+            
+            if self.is_android_termux():
+                try:
+                    self.add_log("Android/Termux detected. Auto-installing native SWC compiler binary for arm64...", "system")
+                    proc2 = subprocess.Popen(["npm", "install", "@next/swc-android-arm64", "--save-optional"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    for line in iter(proc2.stdout.readline, ''):
+                        self.add_log(line.strip(), "setup")
+                    proc2.wait()
+                except Exception as e:
+                    self.add_log(f"Auto swc-android-arm64 install error: {str(e)}", "error")
+
+    def ensure_python_deps(self, service_name, cwd):
+        venv_dir = os.path.join(cwd, ".venv")
+        req_path = os.path.join(cwd, "requirements.txt")
+        
+        if os.path.exists(req_path) and not os.path.exists(venv_dir):
+            self.add_log(f"Virtual environment missing for {service_name}. Creating .venv and running pip install...", "system")
+            use_shell = (os.name == 'nt')
+            try:
+                proc_venv = subprocess.Popen(["python", "-m", "venv", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                for line in iter(proc_venv.stdout.readline, ''):
+                    self.add_log(line.strip(), "setup")
+                proc_venv.wait()
+                
+                venv_py = os.path.join(venv_dir, "bin", "python")
+                if os.name == 'nt':
+                    venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
+                
+                if os.path.exists(venv_py):
+                    proc_pip = subprocess.Popen([venv_py, "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    for line in iter(proc_pip.stdout.readline, ''):
+                        self.add_log(line.strip(), "setup")
+                    proc_pip.wait()
+            except Exception as e:
+                self.add_log(f"Auto python setup error for {service_name}: {str(e)}", "error")
+
     def start_service(self, name):
         status = self.get_status(name)
         if status == "RUNNING":
@@ -319,8 +377,11 @@ class ProcessManager:
         
         if name == "Backend" and svc.get("runtime") == "python":
             self.ensure_backend_env()
+            self.ensure_python_deps(name, cwd)
+        elif name == "AI Engine" and svc.get("runtime") == "python":
+            self.ensure_python_deps(name, cwd)
         elif name == "Frontend" and svc.get("runtime") == "node":
-            self.ensure_nextjs_swc_fix(cwd)
+            self.ensure_frontend_deps(cwd)
 
         self.run_command(cmd, cwd, name)
         return {"status": "success", "message": f"Started {name}"}
