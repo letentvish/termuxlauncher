@@ -420,7 +420,7 @@ class ProcessManager:
                     venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
                 
                 if os.path.exists(venv_py):
-                    proc_pip = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "-r", "requirements.txt"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    proc_pip = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "--only-binary", "pydantic-core,bcrypt,greenlet,pillow", "-r", "requirements.txt"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                     for line in iter(proc_pip.stdout.readline, ''):
                         self.add_log(line.strip(), "setup")
                     proc_pip.wait()
@@ -536,7 +536,7 @@ class ProcessManager:
                         self.add_log(f"Installing python dependencies in venv using {venv_py}...", "system")
                         req_path = os.path.join(cwd, "requirements.txt")
                         if os.path.exists(req_path):
-                            proc = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "-r", "requirements.txt"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            proc = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "--only-binary", "pydantic-core,bcrypt,greenlet,pillow", "-r", "requirements.txt"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                             for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                             proc.wait()
                             
