@@ -1350,6 +1350,7 @@ def get_ip_address():
         return "127.0.0.1"
 
 def start_server():
+    socketserver.TCPServer.allow_reuse_address = True
     server_port = 8080
     while True:
         try:
@@ -1357,22 +1358,23 @@ def start_server():
             server = socketserver.TCPServer(("0.0.0.0", server_port), handler)
             local_ip = get_ip_address()
             
-            print("="*60)
-            print(" BYO-AGENT TERMUX WEB LAUNCHER ACTIVE")
-            print("="*60)
-            print(f" Local Loopback Address:  http://localhost:{server_port}")
-            print(f" Mobile Network Link:    http://{local_ip}:{server_port}")
-            print("="*60)
-            print(" Press Ctrl+C to shutdown.")
-            print("="*60)
+            print("="*60, flush=True)
+            print(" BYO-AGENT TERMUX WEB LAUNCHER ACTIVE", flush=True)
+            print("="*60, flush=True)
+            print(f" Local Loopback Address:  http://localhost:{server_port}", flush=True)
+            print(f" Mobile Network Link:    http://{local_ip}:{server_port}", flush=True)
+            print("="*60, flush=True)
+            print(" Press Ctrl+C to shutdown.", flush=True)
+            print("="*60, flush=True)
             
             server.serve_forever()
             break
         except OSError as e:
-            if e.errno == 98: # Port occupied
+            if server_port < 8100:
+                print(f"[!] Port {server_port} in use/busy, trying {server_port + 1}...", flush=True)
                 server_port += 1
             else:
-                print(f"[!] Startup Error: {str(e)}")
+                print(f"[!] Startup Error: {str(e)}", flush=True)
                 break
 
 if __name__ == "__main__":
