@@ -500,7 +500,7 @@ class ProcessManager:
         if not is_termux:
             return {"status": "error", "message": "This operation is optimized for Termux. Please install build libraries manually on your system."}
         
-        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "rust", "tur-repo", "python-pydantic", "python-cryptography", "python-numpy"]
+        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "rust", "tur-repo"]
         self.run_command(cmd, self.project_dir, task_title="Installing System Packages")
         return {"status": "success", "message": "Triggered Termux build dependencies installation."}
 
