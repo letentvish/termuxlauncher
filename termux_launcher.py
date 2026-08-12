@@ -1015,12 +1015,17 @@ HTML_UI = """<!DOCTYPE html>
                         <i class="fa-solid fa-spinner animate-spin text-[8px]"></i> <span id="logTaskBadgeText">RUNNING</span>
                     </span>
                 </div>
-                <button onclick="clearUIStatusLogs()" class="text-[10px] px-2.5 py-0.5 text-slate-500 hover:text-slate-300 transition-colors">
-                    Clear Logs
-                </button>
+                <div class="flex items-center space-x-1.5">
+                    <button onclick="copyLogsToClipboard()" class="text-[10px] px-2.5 py-1 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 border border-indigo-500/20 rounded-lg transition-all flex items-center gap-1 font-semibold active:scale-95">
+                        <i class="fa-solid fa-copy text-[10px]"></i> Copy Logs
+                    </button>
+                    <button onclick="clearUIStatusLogs()" class="text-[10px] px-2 py-1 text-slate-500 hover:text-slate-300 transition-colors">
+                        Clear
+                    </button>
+                </div>
             </div>
             
-            <div id="logsTerminal" class="h-64 overflow-y-auto bg-black/60 border border-white/5 rounded-xl p-3.5 font-mono text-[10px] text-slate-300 leading-relaxed custom-scrollbar space-y-1">
+            <div id="logsTerminal" class="h-64 overflow-y-auto bg-black/60 border border-white/5 rounded-xl p-3.5 font-mono text-[10px] text-slate-300 leading-relaxed custom-scrollbar space-y-1 select-all">
                 <div class="text-indigo-400/80">[SYSTEM] Terminal initialized. Waiting for process output logs...</div>
             </div>
         </section>
@@ -1520,6 +1525,35 @@ HTML_UI = """<!DOCTYPE html>
                 }
             } catch (e) {
                 console.error("Logs fetch failed", e);
+            }
+        }
+
+        async function copyLogsToClipboard() {
+            const terminal = document.getElementById('logsTerminal');
+            const textToCopy = terminal.innerText || terminal.textContent;
+            
+            if (!textToCopy) {
+                showToast("No logs available to copy", "info");
+                return;
+            }
+
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(textToCopy);
+                } else {
+                    const textarea = document.createElement('textarea');
+                    textarea.value = textToCopy;
+                    textarea.style.position = 'fixed';
+                    textarea.style.opacity = '0';
+                    document.body.appendChild(textarea);
+                    textarea.focus();
+                    textarea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textarea);
+                }
+                showToast("Logs copied to clipboard!", "success");
+            } catch (err) {
+                showToast("Failed to copy logs: " + err.message, "error");
             }
         }
 
