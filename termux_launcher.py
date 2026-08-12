@@ -333,7 +333,7 @@ class ProcessManager:
         if os.path.exists(package_json):
             # 1. Run npm install if node_modules missing
             if not os.path.exists(node_modules):
-                self.add_log("node_modules missing in frontend directory. Running npm install automatically...", "system")
+                self.add_log("node_modules missing in frontend directory. Running npm install...", "system")
                 try:
                     proc = subprocess.Popen(["npm", "install"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                     for line in iter(proc.stdout.readline, ''):
@@ -402,7 +402,7 @@ class ProcessManager:
             self.add_log(f"Virtual environment missing for {service_name}. Creating .venv and running pip install...", "system")
             use_shell = (os.name == 'nt')
             try:
-                proc_venv = subprocess.Popen(["python", "-m", "venv", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                proc_venv = subprocess.Popen(["python", "-m", "venv", "--system-site-packages", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                 for line in iter(proc_venv.stdout.readline, ''):
                     self.add_log(line.strip(), "setup")
                 proc_venv.wait()
@@ -412,7 +412,7 @@ class ProcessManager:
                     venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
                 
                 if os.path.exists(venv_py):
-                    proc_pip = subprocess.Popen([venv_py, "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    proc_pip = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                     for line in iter(proc_pip.stdout.readline, ''):
                         self.add_log(line.strip(), "setup")
                     proc_pip.wait()
@@ -492,7 +492,7 @@ class ProcessManager:
         if not is_termux:
             return {"status": "error", "message": "This operation is optimized for Termux. Please install build libraries manually on your system."}
         
-        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "rust", "tur-repo"]
+        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "rust", "tur-repo", "python-pydantic", "python-cryptography", "python-numpy"]
         self.run_command(cmd, self.project_dir, task_title="Installing System Packages")
         return {"status": "success", "message": "Triggered Termux build dependencies installation."}
 
@@ -511,7 +511,7 @@ class ProcessManager:
                         if not os.path.exists(venv_dir):
                             try:
                                 self.add_log(f"Creating venv in {venv_dir}...", "system")
-                                proc_venv = subprocess.Popen(["python", "-m", "venv", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                                proc_venv = subprocess.Popen(["python", "-m", "venv", "--system-site-packages", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                                 for line in iter(proc_venv.stdout.readline, ''): self.add_log(line.strip(), "setup")
                                 proc_venv.wait()
                             except Exception as e:
@@ -528,7 +528,7 @@ class ProcessManager:
                         self.add_log(f"Installing python dependencies in venv using {venv_py}...", "system")
                         req_path = os.path.join(cwd, "requirements.txt")
                         if os.path.exists(req_path):
-                            proc = subprocess.Popen([venv_py, "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            proc = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                             for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                             proc.wait()
                             
