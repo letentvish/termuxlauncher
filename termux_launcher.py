@@ -263,6 +263,7 @@ class ProcessManager:
                 if name and self.app_config.services.get(name, {}).get("port"):
                     env["PORT"] = str(self.app_config.services[name]["port"])
                 env["CI"] = "true"
+                env["NEXT_DISABLE_SWC"] = "1"
 
                 process = subprocess.Popen(
                     cmd_to_run,
@@ -309,9 +310,6 @@ class ProcessManager:
         )
 
     def ensure_nextjs_swc_fix(self, frontend_path):
-        if not self.is_android_termux():
-            return
-        
         babelrc = os.path.join(frontend_path, ".babelrc")
         babel_js = os.path.join(frontend_path, "babel.config.js")
         
@@ -333,7 +331,7 @@ class ProcessManager:
         use_shell = (os.name == 'nt')
         
         if os.path.exists(package_json):
-            # 1. Run npm install if node_modules is missing
+            # 1. Run npm install if node_modules missing
             if not os.path.exists(node_modules):
                 self.add_log("node_modules missing in frontend directory. Running npm install automatically...", "system")
                 try:
@@ -344,20 +342,57 @@ class ProcessManager:
                 except Exception as e:
                     self.add_log(f"Auto npm install error: {str(e)}", "error")
             
-            # 2. Guarantee SWC compilers (WASM & ARM64) exist on Android/Termux
+            # 2. Guarantee Babel & SWC WASM compiler exist on Android/Termux
             if self.is_android_termux():
-                arm_pkg = os.path.join(node_modules, "@next", "swc-android-arm64")
+                babel_core = os.path.join(node_modules, "@babel", "core")
                 wasm_pkg = os.path.join(node_modules, "@next", "swc-wasm-nodejs")
                 
-                if not os.path.exists(arm_pkg) and not os.path.exists(wasm_pkg):
-                    self.add_log("Android/Termux detected. Installing @next/swc-wasm-nodejs & @next/swc-android-arm64 SWC compilers...", "system")
+                if not os.path.exists(babel_core) or not os.path.exists(wasm_pkg):
+                    self.add_log("Android/Termux detected. Installing @babel/core, babel-preset-next & SWC WASM compilers...", "system")
                     try:
-                        proc2 = subprocess.Popen(["npm", "install", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-optional"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                        proc2 = subprocess.Popen(["npm", "install", "@babel/core", "babel-preset-next", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-dev"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                         for line in iter(proc2.stdout.readline, ''):
                             self.add_log(line.strip(), "setup")
                         proc2.wait()
                     except Exception as e:
-                        self.add_log(f"Auto SWC install error: {str(e)}", "error")
+                        self.add_log(f"Auto Babel/SWC install error: {str(e)}", "error")
+
+    def fix_android_swc(self):
+        fe_svc = self.app_config.services.get("Frontend")
+        if not fe_svc:
+            return {"status": "error", "message": "No Frontend directory detected in current app."}
+        
+        frontend_path = fe_svc["path"]
+        
+        def worker():
+            self.set_task_state(True, "Fixing Android SWC (Babel Setup)")
+            try:
+                use_shell = (os.name == 'nt')
+                self.add_log("=== STARTING ANDROID NEXT.JS BABEL REPAIR ===", "system")
+                
+                # 1. Write .babelrc
+                babelrc = os.path.join(frontend_path, ".babelrc")
+                with open(babelrc, "w", encoding="utf-8") as f:
+                    f.write(json.dumps({"presets": ["next/babel"]}, indent=2))
+                self.add_log("[OK] Created .babelrc configuration.", "system")
+                
+                # 2. Install @babel/core and babel-preset-next
+                self.add_log("Installing @babel/core, babel-preset-next & SWC WASM compilers via npm...", "system")
+                cmd = ["npm", "install", "@babel/core", "babel-preset-next", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-dev"]
+                proc = subprocess.Popen(cmd, cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                for line in iter(proc.stdout.readline, ''):
+                    self.add_log(line.strip(), "setup")
+                proc.wait()
+                
+                self.add_log("=== ANDROID SWC REPAIR COMPLETE ===", "system")
+            except Exception as e:
+                self.add_log(f"SWC Repair Error: {str(e)}", "error")
+            finally:
+                self.set_task_state(False)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return {"status": "success", "message": "Triggered Android SWC / Babel Repair Pipeline."}
 
     def ensure_python_deps(self, service_name, cwd):
         venv_dir = os.path.join(cwd, ".venv")
@@ -505,9 +540,10 @@ class ProcessManager:
                             for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                             proc.wait()
                             
+                            # Automatically install Babel & SWC WASM compilers for Termux
                             if self.is_android_termux():
-                                self.add_log("Android/Termux detected. Installing SWC WASM & ARM64 compiler binaries...", "system")
-                                proc2 = subprocess.Popen(["npm", "install", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-optional"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                                self.add_log("Android/Termux detected. Installing @babel/core, babel-preset-next & SWC WASM compilers...", "system")
+                                proc2 = subprocess.Popen(["npm", "install", "@babel/core", "babel-preset-next", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-dev"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                                 for line in iter(proc2.stdout.readline, ''): self.add_log(line.strip(), "setup")
                                 proc2.wait()
                 
@@ -602,6 +638,8 @@ class ProcessManager:
                             self.add_log(f"[OK] node_modules found for {name}.", "system")
                         else:
                             self.add_log(f"[FAIL] node_modules is missing or incomplete for {name}.", "error")
+                            self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
+
                 for name, svc in self.app_config.services.items():
                     port = svc.get("port")
                     if port:
@@ -808,6 +846,11 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(res)
             return
 
+        elif path == "/api/fix_swc":
+            res = manager.fix_android_swc()
+            self.send_json(res)
+            return
+
         self.send_error(404, "Not Found")
 
     def send_json(self, data, status=200):
@@ -942,16 +985,21 @@ HTML_UI = """<!DOCTYPE html>
             <p class="text-xs text-slate-400 leading-relaxed">
                 Run stages sequentially to configure dependencies for the currently active app.
             </p>
-            <div class="grid grid-cols-2 gap-3 pt-1">
-                <button id="btn_prereqs" onclick="triggerSetup('install_prereqs')" class="p-3 bg-slate-900 border border-white/15 hover:border-indigo-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
-                    <i id="icon_prereqs" class="fa-solid fa-cubes text-indigo-400 text-base mb-2 group-hover:scale-110 transition-transform"></i>
-                    <span class="text-xs font-bold">1. System Pkgs</span>
-                    <span class="text-[9px] text-slate-500 mt-0.5">Node, Python, Git</span>
+            <div class="grid grid-cols-3 gap-2 pt-1">
+                <button id="btn_prereqs" onclick="triggerSetup('install_prereqs')" class="p-2.5 bg-slate-900 border border-white/15 hover:border-indigo-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
+                    <i id="icon_prereqs" class="fa-solid fa-cubes text-indigo-400 text-sm mb-1 group-hover:scale-110 transition-transform"></i>
+                    <span class="text-[11px] font-bold">1. System</span>
+                    <span class="text-[8px] text-slate-500 mt-0.5">Termux Pkgs</span>
                 </button>
-                <button id="btn_deps" onclick="triggerSetup('install_deps')" class="p-3 bg-slate-900 border border-white/15 hover:border-purple-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
-                    <i id="icon_deps" class="fa-solid fa-code-branch text-purple-400 text-base mb-2 group-hover:scale-110 transition-transform"></i>
-                    <span class="text-xs font-bold">2. App Modules</span>
-                    <span class="text-[9px] text-slate-500 mt-0.5">pip & npm scripts</span>
+                <button id="btn_deps" onclick="triggerSetup('install_deps')" class="p-2.5 bg-slate-900 border border-white/15 hover:border-purple-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
+                    <i id="icon_deps" class="fa-solid fa-code-branch text-purple-400 text-sm mb-1 group-hover:scale-110 transition-transform"></i>
+                    <span class="text-[11px] font-bold">2. Modules</span>
+                    <span class="text-[8px] text-slate-500 mt-0.5">pip & npm</span>
+                </button>
+                <button id="btn_swc" onclick="triggerSetup('fix_swc')" class="p-2.5 bg-slate-900 border border-amber-500/30 hover:border-amber-500/60 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95 bg-amber-500/5">
+                    <i id="icon_swc" class="fa-solid fa-wand-magic-sparkles text-amber-400 text-sm mb-1 group-hover:scale-110 transition-transform"></i>
+                    <span class="text-[11px] font-bold text-amber-300">3. Fix SWC</span>
+                    <span class="text-[8px] text-amber-500/80 mt-0.5">Babel Bypass</span>
                 </button>
             </div>
         </section>
@@ -1351,6 +1399,7 @@ HTML_UI = """<!DOCTYPE html>
                 const logBadgeText = document.getElementById('logTaskBadgeText');
                 const btnPrereqs = document.getElementById('btn_prereqs');
                 const btnDeps = document.getElementById('btn_deps');
+                const btnSwc = document.getElementById('btn_swc');
 
                 if (taskState.running) {
                     bannerText.textContent = `Processing: ${taskState.name || 'Running Background Task'}...`;
@@ -1363,6 +1412,7 @@ HTML_UI = """<!DOCTYPE html>
 
                     btnPrereqs.classList.add('opacity-50', 'pointer-events-none');
                     btnDeps.classList.add('opacity-50', 'pointer-events-none');
+                    btnSwc.classList.add('opacity-50', 'pointer-events-none');
                 } else {
                     bannerText.textContent = "Pipeline Idle / Ready";
                     bannerText.className = "text-slate-400 font-normal";
@@ -1373,6 +1423,7 @@ HTML_UI = """<!DOCTYPE html>
 
                     btnPrereqs.classList.remove('opacity-50', 'pointer-events-none');
                     btnDeps.classList.remove('opacity-50', 'pointer-events-none');
+                    btnSwc.classList.remove('opacity-50', 'pointer-events-none');
                 }
 
                 const grid = document.getElementById('servicesGrid');
