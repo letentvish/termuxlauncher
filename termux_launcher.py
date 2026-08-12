@@ -264,10 +264,13 @@ class ProcessManager:
                     env["PORT"] = str(self.app_config.services[name]["port"])
                 env["CI"] = "true"
                 env["NEXT_DISABLE_SWC"] = "1"
+                env["NEXT_TELEMETRY_DISABLED"] = "1"
+                env["WATCHPACK_POLLING"] = "true"
 
                 process = subprocess.Popen(
                     cmd_to_run,
                     cwd=cwd,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -335,7 +338,7 @@ class ProcessManager:
             if not os.path.exists(node_modules):
                 self.add_log("node_modules missing in frontend directory. Running npm install...", "system")
                 try:
-                    proc = subprocess.Popen(["npm", "install"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    proc = subprocess.Popen(["npm", "install"], cwd=frontend_path, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                     for line in iter(proc.stdout.readline, ''):
                         self.add_log(line.strip(), "setup")
                     proc.wait()
@@ -350,7 +353,7 @@ class ProcessManager:
                 if not os.path.exists(babel_core) or not os.path.exists(wasm_pkg):
                     self.add_log("Android/Termux detected. Installing @babel/core, babel-preset-next & SWC WASM compilers...", "system")
                     try:
-                        proc2 = subprocess.Popen(["npm", "install", "@babel/core", "babel-preset-next", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-dev"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                        proc2 = subprocess.Popen(["npm", "install", "@babel/core", "babel-preset-next", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-dev"], cwd=frontend_path, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                         for line in iter(proc2.stdout.readline, ''):
                             self.add_log(line.strip(), "setup")
                         proc2.wait()
@@ -379,7 +382,7 @@ class ProcessManager:
                 # 2. Install @babel/core and babel-preset-next
                 self.add_log("Installing @babel/core, babel-preset-next & SWC WASM compilers via npm...", "system")
                 cmd = ["npm", "install", "@babel/core", "babel-preset-next", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-dev"]
-                proc = subprocess.Popen(cmd, cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                proc = subprocess.Popen(cmd, cwd=frontend_path, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                 for line in iter(proc.stdout.readline, ''):
                     self.add_log(line.strip(), "setup")
                 proc.wait()
@@ -398,21 +401,26 @@ class ProcessManager:
         venv_dir = os.path.join(cwd, ".venv")
         req_path = os.path.join(cwd, "requirements.txt")
         
-        if os.path.exists(req_path) and not os.path.exists(venv_dir):
-            self.add_log(f"Virtual environment missing for {service_name}. Creating .venv and running pip install...", "system")
+        uvicorn_bin = os.path.join(venv_dir, "bin", "uvicorn")
+        if os.name == 'nt':
+            uvicorn_bin = os.path.join(venv_dir, "Scripts", "uvicorn.exe")
+        
+        if os.path.exists(req_path) and (not os.path.exists(venv_dir) or not os.path.exists(uvicorn_bin)):
+            self.add_log(f"Dependencies missing inside .venv for {service_name}. Running setup & pip install...", "system")
             use_shell = (os.name == 'nt')
             try:
-                proc_venv = subprocess.Popen(["python", "-m", "venv", "--system-site-packages", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                for line in iter(proc_venv.stdout.readline, ''):
-                    self.add_log(line.strip(), "setup")
-                proc_venv.wait()
+                if not os.path.exists(venv_dir):
+                    proc_venv = subprocess.Popen(["python", "-m", "venv", "--system-site-packages", ".venv"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    for line in iter(proc_venv.stdout.readline, ''):
+                        self.add_log(line.strip(), "setup")
+                    proc_venv.wait()
                 
                 venv_py = os.path.join(venv_dir, "bin", "python")
                 if os.name == 'nt':
                     venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
                 
                 if os.path.exists(venv_py):
-                    proc_pip = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    proc_pip = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "-r", "requirements.txt"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                     for line in iter(proc_pip.stdout.readline, ''):
                         self.add_log(line.strip(), "setup")
                     proc_pip.wait()
@@ -511,7 +519,7 @@ class ProcessManager:
                         if not os.path.exists(venv_dir):
                             try:
                                 self.add_log(f"Creating venv in {venv_dir}...", "system")
-                                proc_venv = subprocess.Popen(["python", "-m", "venv", "--system-site-packages", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                                proc_venv = subprocess.Popen(["python", "-m", "venv", "--system-site-packages", ".venv"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                                 for line in iter(proc_venv.stdout.readline, ''): self.add_log(line.strip(), "setup")
                                 proc_venv.wait()
                             except Exception as e:
@@ -528,7 +536,7 @@ class ProcessManager:
                         self.add_log(f"Installing python dependencies in venv using {venv_py}...", "system")
                         req_path = os.path.join(cwd, "requirements.txt")
                         if os.path.exists(req_path):
-                            proc = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            proc = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "-r", "requirements.txt"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                             for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                             proc.wait()
                             
@@ -536,14 +544,14 @@ class ProcessManager:
                         self.add_log(f"Installing npm packages for {name}...", "system")
                         package_path = os.path.join(cwd, "package.json")
                         if os.path.exists(package_path):
-                            proc = subprocess.Popen(["npm", "install"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            proc = subprocess.Popen(["npm", "install"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                             for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                             proc.wait()
                             
                             # Automatically install Babel & SWC WASM compilers for Termux
                             if self.is_android_termux():
                                 self.add_log("Android/Termux detected. Installing @babel/core, babel-preset-next & SWC WASM compilers...", "system")
-                                proc2 = subprocess.Popen(["npm", "install", "@babel/core", "babel-preset-next", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-dev"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                                proc2 = subprocess.Popen(["npm", "install", "@babel/core", "babel-preset-next", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-dev"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                                 for line in iter(proc2.stdout.readline, ''): self.add_log(line.strip(), "setup")
                                 proc2.wait()
                 
