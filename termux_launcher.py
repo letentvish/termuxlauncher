@@ -190,6 +190,15 @@ class ProcessManager:
         self.app_config = AppConfig(self.project_dir)
         
         self.log_limit = 1000
+        
+        # Task progress tracking
+        self.is_task_running = False
+        self.active_task_name = None
+
+    def set_task_state(self, is_running, task_name=None):
+        with self.lock:
+            self.is_task_running = is_running
+            self.active_task_name = task_name if is_running else None
 
     def set_project_dir(self, path):
         with self.lock:
@@ -231,8 +240,10 @@ class ProcessManager:
             return "BUSY (EXTERNAL)"
         return "STOPPED"
 
-    def run_command(self, cmd, cwd, name=None):
+    def run_command(self, cmd, cwd, name=None, task_title=None):
         def worker():
+            if task_title:
+                self.set_task_state(True, task_title)
             try:
                 self.add_log(f"Starting process: {' '.join(cmd)} in {cwd}", "system")
                 use_shell = (os.name == 'nt')
@@ -282,6 +293,9 @@ class ProcessManager:
                 if name:
                     with self.lock:
                         self.processes[name] = None
+            finally:
+                if task_title:
+                    self.set_task_state(False)
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -437,58 +451,62 @@ class ProcessManager:
             return {"status": "error", "message": "This operation is optimized for Termux. Please install build libraries manually on your system."}
         
         cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "rust", "tur-repo"]
-        self.run_command(cmd, self.project_dir)
+        self.run_command(cmd, self.project_dir, task_title="Installing System Packages")
         return {"status": "success", "message": "Triggered Termux build dependencies installation."}
 
     def install_deps(self):
         def worker():
-            use_shell = (os.name == 'nt')
-            
-            for name, svc in self.app_config.services.items():
-                cwd = svc["path"]
-                if svc["runtime"] == "python":
-                    self.add_log(f"Setting up Python virtual environment for {name}...", "system")
-                    
-                    venv_dir = os.path.join(cwd, ".venv")
-                    if not os.path.exists(venv_dir):
-                        try:
-                            self.add_log(f"Creating venv in {venv_dir}...", "system")
-                            proc_venv = subprocess.Popen(["python", "-m", "venv", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                            for line in iter(proc_venv.stdout.readline, ''): self.add_log(line.strip(), "setup")
-                            proc_venv.wait()
-                        except Exception as e:
-                            self.add_log(f"Venv creation failed: {str(e)}", "error")
-                    
-                    venv_py = os.path.join(venv_dir, "bin", "python")
-                    if os.name == 'nt':
-                        venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
-                    
-                    if not os.path.exists(venv_py):
-                        venv_py = "python"
-                        self.add_log("Venv python not found, falling back to system Python.", "error")
-                    
-                    self.add_log(f"Installing python dependencies in venv using {venv_py}...", "system")
-                    req_path = os.path.join(cwd, "requirements.txt")
-                    if os.path.exists(req_path):
-                        proc = subprocess.Popen([venv_py, "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                        for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
-                        proc.wait()
+            self.set_task_state(True, "Installing App Modules")
+            try:
+                use_shell = (os.name == 'nt')
+                
+                for name, svc in self.app_config.services.items():
+                    cwd = svc["path"]
+                    if svc["runtime"] == "python":
+                        self.add_log(f"Setting up Python virtual environment for {name}...", "system")
                         
-                elif svc["runtime"] == "node":
-                    self.add_log(f"Installing npm packages for {name}...", "system")
-                    package_path = os.path.join(cwd, "package.json")
-                    if os.path.exists(package_path):
-                        proc = subprocess.Popen(["npm", "install"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                        for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
-                        proc.wait()
+                        venv_dir = os.path.join(cwd, ".venv")
+                        if not os.path.exists(venv_dir):
+                            try:
+                                self.add_log(f"Creating venv in {venv_dir}...", "system")
+                                proc_venv = subprocess.Popen(["python", "-m", "venv", ".venv"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                                for line in iter(proc_venv.stdout.readline, ''): self.add_log(line.strip(), "setup")
+                                proc_venv.wait()
+                            except Exception as e:
+                                self.add_log(f"Venv creation failed: {str(e)}", "error")
                         
-                        if self.is_android_termux():
-                            self.add_log("Android/Termux detected. Installing native SWC compiler binary for arm64...", "system")
-                            proc2 = subprocess.Popen(["npm", "install", "@next/swc-android-arm64", "--save-optional"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                            for line in iter(proc2.stdout.readline, ''): self.add_log(line.strip(), "setup")
-                            proc2.wait()
-            
-            self.add_log("All dependencies installation processes complete.", "system")
+                        venv_py = os.path.join(venv_dir, "bin", "python")
+                        if os.name == 'nt':
+                            venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
+                        
+                        if not os.path.exists(venv_py):
+                            venv_py = "python"
+                            self.add_log("Venv python not found, falling back to system Python.", "error")
+                        
+                        self.add_log(f"Installing python dependencies in venv using {venv_py}...", "system")
+                        req_path = os.path.join(cwd, "requirements.txt")
+                        if os.path.exists(req_path):
+                            proc = subprocess.Popen([venv_py, "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
+                            proc.wait()
+                            
+                    elif svc["runtime"] == "node":
+                        self.add_log(f"Installing npm packages for {name}...", "system")
+                        package_path = os.path.join(cwd, "package.json")
+                        if os.path.exists(package_path):
+                            proc = subprocess.Popen(["npm", "install"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
+                            proc.wait()
+                            
+                            if self.is_android_termux():
+                                self.add_log("Android/Termux detected. Installing native SWC compiler binary for arm64...", "system")
+                                proc2 = subprocess.Popen(["npm", "install", "@next/swc-android-arm64", "--save-optional"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                                for line in iter(proc2.stdout.readline, ''): self.add_log(line.strip(), "setup")
+                                proc2.wait()
+                
+                self.add_log("All dependencies installation processes complete.", "system")
+            finally:
+                self.set_task_state(False)
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -527,65 +545,69 @@ class ProcessManager:
             return {"status": "error", "message": f"App '{repo_name}' already exists in library."}
         
         cmd = ["git", "clone", repo_url, dest_dir]
-        self.run_command(cmd, self.launcher_dir)
+        self.run_command(cmd, self.launcher_dir, task_title=f"Cloning {repo_name}")
         return {"status": "success", "message": f"Started cloning {repo_name}..."}
 
     def run_diagnostics(self):
         def worker():
-            self.add_log("=== RUNNING SYSTEM DIAGNOSTICS ===", "system")
-            use_shell = (os.name == 'nt')
-            
+            self.set_task_state(True, "Running System Diagnostics")
             try:
-                res = subprocess.run(["python", "--version"], capture_output=True, text=True, shell=use_shell)
-                self.add_log(f"[OK] Python version: {res.stdout.strip() or res.stderr.strip()}", "system")
-            except Exception as e:
-                self.add_log(f"[FAIL] Python check: {str(e)}", "error")
+                self.add_log("=== RUNNING SYSTEM DIAGNOSTICS ===", "system")
+                use_shell = (os.name == 'nt')
+                
+                try:
+                    res = subprocess.run(["python", "--version"], capture_output=True, text=True, shell=use_shell)
+                    self.add_log(f"[OK] Python version: {res.stdout.strip() or res.stderr.strip()}", "system")
+                except Exception as e:
+                    self.add_log(f"[FAIL] Python check: {str(e)}", "error")
 
-            try:
-                res = subprocess.run(["node", "--version"], capture_output=True, text=True, shell=use_shell)
-                self.add_log(f"[OK] Node.js version: {res.stdout.strip() or res.stderr.strip()}", "system")
-            except Exception as e:
-                self.add_log(f"[FAIL] Node.js check: {str(e)}", "error")
+                try:
+                    res = subprocess.run(["node", "--version"], capture_output=True, text=True, shell=use_shell)
+                    self.add_log(f"[OK] Node.js version: {res.stdout.strip() or res.stderr.strip()}", "system")
+                except Exception as e:
+                    self.add_log(f"[FAIL] Node.js check: {str(e)}", "error")
 
-            for name, svc in self.app_config.services.items():
-                if svc["runtime"] == "python":
-                    self.add_log(f"Checking Python libraries in target folder: {svc['path']}", "system")
-                    test_script = "import sys; import fastapi; import uvicorn; import pydantic; import openai; print('OK: All imports succeeded!')"
-                    try:
-                        cmd = ["python", "-c", test_script]
-                        venv_py = os.path.join(svc["path"], "venv", "bin", "python")
-                        if not os.path.exists(venv_py):
-                            venv_py = os.path.join(svc["path"], ".venv", "bin", "python")
-                        if os.path.exists(venv_py):
-                            cmd[0] = venv_py
-                        
-                        res = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
-                        if res.returncode == 0:
-                            self.add_log(f"[OK] Python libraries ({name}): {res.stdout.strip()}", "system")
+                for name, svc in self.app_config.services.items():
+                    if svc["runtime"] == "python":
+                        self.add_log(f"Checking Python libraries in target folder: {svc['path']}", "system")
+                        test_script = "import sys; import fastapi; import uvicorn; import pydantic; import openai; print('OK: All imports succeeded!')"
+                        try:
+                            cmd = ["python", "-c", test_script]
+                            venv_py = os.path.join(svc["path"], "venv", "bin", "python")
+                            if not os.path.exists(venv_py):
+                                venv_py = os.path.join(svc["path"], ".venv", "bin", "python")
+                            if os.path.exists(venv_py):
+                                cmd[0] = venv_py
+                            
+                            res = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
+                            if res.returncode == 0:
+                                self.add_log(f"[OK] Python libraries ({name}): {res.stdout.strip()}", "system")
+                            else:
+                                self.add_log(f"[FAIL] Python libraries ({name}) error: {res.stderr.strip()}", "error")
+                                self.add_log("[TIP] Make sure to run '2. App Modules' to install missing requirements.", "system")
+                        except Exception as e:
+                            self.add_log(f"[FAIL] Python import test failed to run: {str(e)}", "error")
+
+                for name, svc in self.app_config.services.items():
+                    if svc["runtime"] == "node":
+                        next_binary = os.path.join(svc["path"], "node_modules", ".bin", "next")
+                        if os.path.exists(next_binary) or os.path.exists(next_binary + ".cmd"):
+                            self.add_log(f"[OK] node_modules found for {name}.", "system")
                         else:
-                            self.add_log(f"[FAIL] Python libraries ({name}) error: {res.stderr.strip()}", "error")
-                            self.add_log("[TIP] Make sure to run '2. App Modules' to install missing requirements.", "system")
-                    except Exception as e:
-                        self.add_log(f"[FAIL] Python import test failed to run: {str(e)}", "error")
+                            self.add_log(f"[FAIL] node_modules is missing or incomplete for {name}.", "error")
+                            self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
 
-            for name, svc in self.app_config.services.items():
-                if svc["runtime"] == "node":
-                    next_binary = os.path.join(svc["path"], "node_modules", ".bin", "next")
-                    if os.path.exists(next_binary) or os.path.exists(next_binary + ".cmd"):
-                        self.add_log(f"[OK] node_modules found for {name}.", "system")
-                    else:
-                        self.add_log(f"[FAIL] node_modules is missing or incomplete for {name}.", "error")
-                        self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
+                for name, svc in self.app_config.services.items():
+                    port = svc.get("port")
+                    if port:
+                        if self.is_port_in_use(port):
+                            self.add_log(f"[INFO] Port {port} ({name}) is CURRENTLY IN USE by an external process.", "system")
+                        else:
+                            self.add_log(f"[OK] Port {port} ({name}) is free.", "system")
 
-            for name, svc in self.app_config.services.items():
-                port = svc.get("port")
-                if port:
-                    if self.is_port_in_use(port):
-                        self.add_log(f"[INFO] Port {port} ({name}) is CURRENTLY IN USE by an external process.", "system")
-                    else:
-                        self.add_log(f"[OK] Port {port} ({name}) is free.", "system")
-
-            self.add_log("=== DIAGNOSTICS COMPLETE ===", "system")
+                self.add_log("=== DIAGNOSTICS COMPLETE ===", "system")
+            finally:
+                self.set_task_state(False)
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -621,8 +643,14 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             return
 
         elif path == "/api/status":
+            with manager.lock:
+                task_state = {
+                    "running": manager.is_task_running,
+                    "name": manager.active_task_name
+                }
             data = {
                 "project_dir": manager.project_dir,
+                "task_state": task_state,
                 "services": {
                     name: {
                         "status": manager.get_status(name),
@@ -835,7 +863,7 @@ HTML_UI = """<!DOCTYPE html>
             <div class="space-y-3">
                 <div class="flex gap-2">
                     <input type="text" id="repoUrlInput" placeholder="Paste GitHub Repository URL" class="flex-1 bg-black/20 border border-white/5 rounded-xl px-4 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 transition-all font-mono" />
-                    <button onclick="cloneApp()" class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-95">
+                    <button id="btn_import_repo" onclick="cloneApp()" class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md active:scale-95">
                         Import
                     </button>
                 </div>
@@ -887,20 +915,34 @@ HTML_UI = """<!DOCTYPE html>
 
         <!-- 5. Setup Commands Pipeline -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
-            <h2 class="text-sm font-bold tracking-wide text-purple-300 uppercase flex items-center gap-1.5">
-                <i class="fa-solid fa-gears text-xs"></i> Installation Pipeline
-            </h2>
+            <div class="flex items-center justify-between">
+                <h2 class="text-sm font-bold tracking-wide text-purple-300 uppercase flex items-center gap-1.5">
+                    <i class="fa-solid fa-gears text-xs"></i> Installation Pipeline
+                </h2>
+            </div>
+            
+            <!-- Live Progress Indicator Banner -->
+            <div id="pipelineStatusBanner" class="p-3 bg-slate-900/80 border border-white/10 rounded-xl flex items-center justify-between text-xs font-medium">
+                <div class="flex items-center space-x-2.5">
+                    <span id="pipelineStatusIcon" class="w-2 h-2 rounded-full bg-slate-500"></span>
+                    <span id="pipelineStatusText" class="text-slate-400">Pipeline Idle</span>
+                </div>
+                <div id="pipelineSpinner" class="hidden">
+                    <i class="fa-solid fa-circle-notch animate-spin text-indigo-400 text-sm"></i>
+                </div>
+            </div>
+
             <p class="text-xs text-slate-400 leading-relaxed">
                 Run stages sequentially to configure dependencies for the currently active app.
             </p>
             <div class="grid grid-cols-2 gap-3 pt-1">
-                <button onclick="triggerSetup('install_prereqs')" class="p-3 bg-slate-900 border border-white/15 hover:border-indigo-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
-                    <i class="fa-solid fa-cubes text-indigo-400 text-base mb-2 group-hover:scale-110 transition-transform"></i>
+                <button id="btn_prereqs" onclick="triggerSetup('install_prereqs')" class="p-3 bg-slate-900 border border-white/15 hover:border-indigo-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
+                    <i id="icon_prereqs" class="fa-solid fa-cubes text-indigo-400 text-base mb-2 group-hover:scale-110 transition-transform"></i>
                     <span class="text-xs font-bold">1. System Pkgs</span>
                     <span class="text-[9px] text-slate-500 mt-0.5">Node, Python, Git</span>
                 </button>
-                <button onclick="triggerSetup('install_deps')" class="p-3 bg-slate-900 border border-white/15 hover:border-purple-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
-                    <i class="fa-solid fa-code-branch text-purple-400 text-base mb-2 group-hover:scale-110 transition-transform"></i>
+                <button id="btn_deps" onclick="triggerSetup('install_deps')" class="p-3 bg-slate-900 border border-white/15 hover:border-purple-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
+                    <i id="icon_deps" class="fa-solid fa-code-branch text-purple-400 text-base mb-2 group-hover:scale-110 transition-transform"></i>
                     <span class="text-xs font-bold">2. App Modules</span>
                     <span class="text-[9px] text-slate-500 mt-0.5">pip & npm scripts</span>
                 </button>
@@ -910,9 +952,14 @@ HTML_UI = """<!DOCTYPE html>
         <!-- 6. Terminal Log Output -->
         <section class="bg-black/40 border border-white/15 rounded-2xl p-5 shadow-2xl space-y-4">
             <div class="flex items-center justify-between">
-                <h2 class="text-sm font-bold tracking-wide text-amber-300 uppercase flex items-center gap-1.5">
-                    <i class="fa-solid fa-terminal text-xs"></i> System Stream Logs
-                </h2>
+                <div class="flex items-center space-x-2">
+                    <h2 class="text-sm font-bold tracking-wide text-amber-300 uppercase flex items-center gap-1.5">
+                        <i class="fa-solid fa-terminal text-xs"></i> System Stream Logs
+                    </h2>
+                    <span id="logTaskBadge" class="hidden text-[9px] font-bold px-2 py-0.5 bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 rounded-md animate-pulse flex items-center gap-1">
+                        <i class="fa-solid fa-spinner animate-spin text-[8px]"></i> <span id="logTaskBadgeText">RUNNING</span>
+                    </span>
+                </div>
                 <button onclick="clearUIStatusLogs()" class="text-[10px] px-2.5 py-0.5 text-slate-500 hover:text-slate-300 transition-colors">
                     Clear Logs
                 </button>
@@ -958,6 +1005,7 @@ HTML_UI = """<!DOCTYPE html>
         let currentPath = '';
         let logsLength = 0;
         let settingsSchema = [];
+        let isTaskActive = false;
 
         // Toast Helper
         function showToast(message, type = 'info') {
@@ -1263,12 +1311,13 @@ HTML_UI = """<!DOCTYPE html>
 
         // Setup triggers
         async function triggerSetup(action) {
-            showToast("Starting pipeline action...", "info");
+            showToast("Starting pipeline task...", "info");
             try {
                 const res = await fetch(`/api/${action}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'success') {
-                    showToast("Pipeline task successfully started.", 'success');
+                    showToast(data.message, 'success');
+                    fetchStatus();
                 } else {
                     showToast(data.message, 'error');
                 }
@@ -1285,6 +1334,39 @@ HTML_UI = """<!DOCTYPE html>
                 
                 document.getElementById('projectPathDisplay').textContent = data.project_dir;
                 currentPath = data.project_dir;
+
+                // Handle task progress state
+                const taskState = data.task_state || { running: false, name: null };
+                const bannerText = document.getElementById('pipelineStatusText');
+                const bannerIcon = document.getElementById('pipelineStatusIcon');
+                const bannerSpinner = document.getElementById('pipelineSpinner');
+                const logBadge = document.getElementById('logTaskBadge');
+                const logBadgeText = document.getElementById('logTaskBadgeText');
+                const btnPrereqs = document.getElementById('btn_prereqs');
+                const btnDeps = document.getElementById('btn_deps');
+
+                if (taskState.running) {
+                    bannerText.textContent = `Processing: ${taskState.name || 'Running Background Task'}...`;
+                    bannerText.className = "text-indigo-400 font-bold animate-pulse";
+                    bannerIcon.className = "w-2 h-2 rounded-full bg-indigo-500 animate-ping";
+                    bannerSpinner.classList.remove('hidden');
+                    
+                    logBadge.classList.remove('hidden');
+                    logBadgeText.textContent = (taskState.name || 'PROCESSING').toUpperCase();
+
+                    btnPrereqs.classList.add('opacity-50', 'pointer-events-none');
+                    btnDeps.classList.add('opacity-50', 'pointer-events-none');
+                } else {
+                    bannerText.textContent = "Pipeline Idle / Ready";
+                    bannerText.className = "text-slate-400 font-normal";
+                    bannerIcon.className = "w-2 h-2 rounded-full bg-emerald-500";
+                    bannerSpinner.classList.add('hidden');
+                    
+                    logBadge.classList.add('hidden');
+
+                    btnPrereqs.classList.remove('opacity-50', 'pointer-events-none');
+                    btnDeps.classList.remove('opacity-50', 'pointer-events-none');
+                }
 
                 const grid = document.getElementById('servicesGrid');
                 grid.innerHTML = '';
@@ -1392,9 +1474,9 @@ HTML_UI = """<!DOCTYPE html>
         fetchStatus();
         fetchApps();
         loadSettings();
-        setInterval(fetchStatus, 3000);
+        setInterval(fetchStatus, 2000);
         setInterval(fetchApps, 6000);
-        setInterval(fetchLogs, 1500);
+        setInterval(fetchLogs, 1000);
     </script>
 </body>
 </html>
