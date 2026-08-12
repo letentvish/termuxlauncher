@@ -330,27 +330,34 @@ class ProcessManager:
         
         node_modules = os.path.join(frontend_path, "node_modules")
         package_json = os.path.join(frontend_path, "package.json")
+        use_shell = (os.name == 'nt')
         
-        if os.path.exists(package_json) and not os.path.exists(node_modules):
-            self.add_log("node_modules missing in frontend directory. Running npm install automatically...", "system")
-            use_shell = (os.name == 'nt')
-            try:
-                proc = subprocess.Popen(["npm", "install"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                for line in iter(proc.stdout.readline, ''):
-                    self.add_log(line.strip(), "setup")
-                proc.wait()
-            except Exception as e:
-                self.add_log(f"Auto npm install error: {str(e)}", "error")
-            
-            if self.is_android_termux():
+        if os.path.exists(package_json):
+            # 1. Run npm install if node_modules is missing
+            if not os.path.exists(node_modules):
+                self.add_log("node_modules missing in frontend directory. Running npm install automatically...", "system")
                 try:
-                    self.add_log("Android/Termux detected. Auto-installing native SWC compiler binary for arm64...", "system")
-                    proc2 = subprocess.Popen(["npm", "install", "@next/swc-android-arm64", "--save-optional"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
-                    for line in iter(proc2.stdout.readline, ''):
+                    proc = subprocess.Popen(["npm", "install"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    for line in iter(proc.stdout.readline, ''):
                         self.add_log(line.strip(), "setup")
-                    proc2.wait()
+                    proc.wait()
                 except Exception as e:
-                    self.add_log(f"Auto swc-android-arm64 install error: {str(e)}", "error")
+                    self.add_log(f"Auto npm install error: {str(e)}", "error")
+            
+            # 2. Guarantee SWC compilers (WASM & ARM64) exist on Android/Termux
+            if self.is_android_termux():
+                arm_pkg = os.path.join(node_modules, "@next", "swc-android-arm64")
+                wasm_pkg = os.path.join(node_modules, "@next", "swc-wasm-nodejs")
+                
+                if not os.path.exists(arm_pkg) and not os.path.exists(wasm_pkg):
+                    self.add_log("Android/Termux detected. Installing @next/swc-wasm-nodejs & @next/swc-android-arm64 SWC compilers...", "system")
+                    try:
+                        proc2 = subprocess.Popen(["npm", "install", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-optional"], cwd=frontend_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                        for line in iter(proc2.stdout.readline, ''):
+                            self.add_log(line.strip(), "setup")
+                        proc2.wait()
+                    except Exception as e:
+                        self.add_log(f"Auto SWC install error: {str(e)}", "error")
 
     def ensure_python_deps(self, service_name, cwd):
         venv_dir = os.path.join(cwd, ".venv")
@@ -499,8 +506,8 @@ class ProcessManager:
                             proc.wait()
                             
                             if self.is_android_termux():
-                                self.add_log("Android/Termux detected. Installing native SWC compiler binary for arm64...", "system")
-                                proc2 = subprocess.Popen(["npm", "install", "@next/swc-android-arm64", "--save-optional"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                                self.add_log("Android/Termux detected. Installing SWC WASM & ARM64 compiler binaries...", "system")
+                                proc2 = subprocess.Popen(["npm", "install", "@next/swc-wasm-nodejs", "@next/swc-android-arm64", "--save-optional"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                                 for line in iter(proc2.stdout.readline, ''): self.add_log(line.strip(), "setup")
                                 proc2.wait()
                 
@@ -595,8 +602,6 @@ class ProcessManager:
                             self.add_log(f"[OK] node_modules found for {name}.", "system")
                         else:
                             self.add_log(f"[FAIL] node_modules is missing or incomplete for {name}.", "error")
-                            self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
-
                 for name, svc in self.app_config.services.items():
                     port = svc.get("port")
                     if port:
@@ -606,6 +611,8 @@ class ProcessManager:
                             self.add_log(f"[OK] Port {port} ({name}) is free.", "system")
 
                 self.add_log("=== DIAGNOSTICS COMPLETE ===", "system")
+            except Exception as e:
+                self.add_log(f"Diagnostics error: {str(e)}", "error")
             finally:
                 self.set_task_state(False)
 
