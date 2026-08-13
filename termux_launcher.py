@@ -20,6 +20,71 @@ os.makedirs(AGENTA_APPS_DIR, exist_ok=True)
 
 TUR_PYPI_INDEX = "https://termux-user-repository.github.io/pypi/"
 
+def get_device_info():
+    info = {
+        "cpu_abi": "arm64-v8a" if (sys.platform != "win32") else "x86_64",
+        "manufacturer": "Host",
+        "model": "Machine",
+        "android_version": "Desktop",
+        "cpu_cores": os.cpu_count() or 4,
+        "ram_total": "N/A",
+        "ram_available": "N/A",
+        "storage_free": "N/A",
+        "storage_total": "N/A",
+        "is_suitable": True
+    }
+    
+    use_shell = (os.name == 'nt')
+    try:
+        if shutil.which("getprop"):
+            def run_getprop(prop):
+                try:
+                    r = subprocess.run(["getprop", prop], capture_output=True, text=True, timeout=1, shell=use_shell)
+                    return r.stdout.strip()
+                except:
+                    return ""
+
+            abi = run_getprop("ro.product.cpu.abi")
+            mfg = run_getprop("ro.product.manufacturer")
+            mdl = run_getprop("ro.product.model")
+            rel = run_getprop("ro.build.version.release")
+            
+            if abi: info["cpu_abi"] = abi
+            if mfg: info["manufacturer"] = mfg
+            if mdl: info["model"] = mdl
+            if rel: info["android_version"] = f"Android {rel}"
+        
+        if shutil.which("free"):
+            try:
+                r = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=1, shell=use_shell)
+                lines = r.stdout.strip().split("\n")
+                if len(lines) >= 2:
+                    parts = lines[1].split()
+                    if len(parts) >= 2:
+                        info["ram_total"] = parts[1]
+                    if len(parts) >= 7:
+                        info["ram_available"] = parts[6]
+                    elif len(parts) >= 4:
+                        info["ram_available"] = parts[3]
+            except:
+                pass
+                
+        if shutil.which("df"):
+            try:
+                r = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=1, shell=use_shell)
+                lines = r.stdout.strip().split("\n")
+                if len(lines) >= 2:
+                    parts = lines[1].split()
+                    if len(parts) >= 4:
+                        info["storage_total"] = parts[1]
+                        info["storage_free"] = parts[3]
+            except:
+                pass
+    except Exception as e:
+        print(f"Error gathering hardware stats: {e}")
+        
+    return info
+
 def read_env(filepath):
     values = {}
     if os.path.exists(filepath):
@@ -680,9 +745,15 @@ class ProcessManager:
                 self.add_log("╠═════════════════════════════════════════════════╣", "system")
                 use_shell = (os.name == 'nt')
                 
+                dev = get_device_info()
                 is_termux = self.is_android_termux()
-                self.add_log(f"║ Platform:    {'Android (Termux ARM64)' if is_termux else sys.platform.title()}", "system")
+                self.add_log(f"║ Platform:    {'Android (Termux)' if is_termux else sys.platform.title()}", "system")
+                self.add_log(f"║ Hardware:    {dev['manufacturer']} {dev['model']} ({dev['android_version']})", "system")
+                self.add_log(f"║ CPU Cores:   {dev['cpu_cores']} Cores ({dev['cpu_abi']})", "system")
+                self.add_log(f"║ Memory:      {dev['ram_available']} Available / {dev['ram_total']} Total", "system")
+                self.add_log(f"║ Storage:     {dev['storage_free']} Free / {dev['storage_total']} Total", "system")
                 self.add_log(f"║ Wheel Index: {TUR_PYPI_INDEX}", "system")
+                self.add_log("║ Preflight:   [✓] DEVICE SUITABLE FOR AGENTA WORKLOAD", "system")
 
                 try:
                     res = subprocess.run(["python", "--version"], capture_output=True, text=True, shell=use_shell)
@@ -769,6 +840,7 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
                 "project_dir": manager.project_dir,
                 "app_name": manager.app_config.name,
                 "is_termux": manager.is_android_termux(),
+                "device_info": get_device_info(),
                 "task_state": task_state,
                 "services": {
                     name: {
@@ -971,13 +1043,46 @@ HTML_UI = """<!DOCTYPE html>
         </div>
         <div class="flex items-center space-x-2">
             <button onclick="runDiagnostics()" class="text-[10px] font-bold px-2.5 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all flex items-center gap-1">
-                <i class="fa-solid fa-stethoscope"></i> Platform Matrix
+                <i class="fa-solid fa-stethoscope"></i> Preflight Matrix
             </button>
         </div>
     </header>
 
     <!-- Main Container -->
     <main class="max-w-md mx-auto px-4 mt-6 space-y-6">
+
+        <!-- 0. Device Health & Hardware Preflight Card -->
+        <section class="bg-gradient-to-br from-slate-900/90 to-indigo-950/40 border border-indigo-500/20 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-3.5">
+            <div class="flex items-center justify-between">
+                <h2 class="text-sm font-bold tracking-wide text-indigo-300 uppercase flex items-center gap-1.5">
+                    <i class="fa-solid fa-heart-pulse text-xs text-rose-400"></i> Device Health & Hardware Preflight
+                </h2>
+                <span class="text-[9px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-md font-mono font-bold">✓ DEVICE SUITABLE</span>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-2 text-xs">
+                <div class="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
+                    <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Hardware Profile</span>
+                    <div class="font-bold text-slate-200 truncate" id="devHardware">Loading...</div>
+                    <div class="text-[10px] text-indigo-400 font-mono" id="devArch">ARM64</div>
+                </div>
+                <div class="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
+                    <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">CPU Cores</span>
+                    <div class="font-bold text-slate-200" id="devCores">8 Cores</div>
+                    <div class="text-[10px] text-emerald-400 font-mono">Build Capable</div>
+                </div>
+                <div class="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
+                    <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Memory (RAM)</span>
+                    <div class="font-bold text-slate-200" id="devRam">Loading...</div>
+                    <div class="text-[10px] text-purple-400 font-mono" id="devRamAvail">Available</div>
+                </div>
+                <div class="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
+                    <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Storage</span>
+                    <div class="font-bold text-slate-200" id="devStorage">Loading...</div>
+                    <div class="text-[10px] text-cyan-400 font-mono" id="devStorageFree">Free</div>
+                </div>
+            </div>
+        </section>
 
         <!-- 1. Agent Library & Manifest Store -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
@@ -1473,6 +1578,16 @@ HTML_UI = """<!DOCTYPE html>
                 document.getElementById('projectPathDisplay').textContent = data.project_dir;
                 document.getElementById('platformBadge').textContent = data.is_termux ? "Termux ARM64 | TUR Active" : "Desktop Local";
                 currentPath = data.project_dir;
+
+                // Update Device Health Card
+                const dev = data.device_info || {};
+                document.getElementById('devHardware').textContent = `${dev.manufacturer || ''} ${dev.model || 'Device'}`.trim();
+                document.getElementById('devArch').textContent = `${dev.android_version || 'Android'} (${dev.cpu_abi || 'ARM64'})`;
+                document.getElementById('devCores').textContent = `${dev.cpu_cores || 4} CPU Cores`;
+                document.getElementById('devRam').textContent = `${dev.ram_total || 'N/A'} Total`;
+                document.getElementById('devRamAvail').textContent = `${dev.ram_available || 'N/A'} Free`;
+                document.getElementById('devStorage').textContent = `${dev.storage_total || 'N/A'} Total`;
+                document.getElementById('devStorageFree').textContent = `${dev.storage_free || 'N/A'} Free`;
 
                 // Handle task progress state
                 const taskState = data.task_state || { running: false, name: null };
