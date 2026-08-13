@@ -279,6 +279,17 @@ class ProcessManager:
                 env = dict(os.environ)
                 if name and self.app_config.services.get(name, {}).get("port"):
                     env["PORT"] = str(self.app_config.services[name]["port"])
+                
+                # Check Redis server audit for AI Engine
+                if name and "ai" in name.lower():
+                    redis_active = self.is_port_in_use(6379)
+                    if not redis_active:
+                        self.add_log("[AGENTA AUDIT] Redis server not detected on port 6379. AI Engine configured for local in-memory/JSON fallback cache.", "system")
+                        env["REDIS_ENABLED"] = "false"
+                        env["USE_REDIS"] = "false"
+                    else:
+                        self.add_log("[AGENTA AUDIT] Redis server active on port 6379.", "system")
+
                 env["CI"] = "true"
                 env["NEXT_DISABLE_SWC"] = "1"
                 env["NEXT_TELEMETRY_DISABLED"] = "1"
@@ -531,7 +542,7 @@ class ProcessManager:
         if not is_termux:
             return {"status": "error", "message": "This operation is optimized for Termux. Please install build libraries manually on your system."}
         
-        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "tur-repo"]
+        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "libjpeg-turbo", "libpng", "freetype", "zlib", "tur-repo"]
         self.run_command(cmd, self.project_dir, task_title="Installing System Packages")
         return {"status": "success", "message": "Triggered Termux build dependencies installation."}
 
@@ -627,7 +638,6 @@ class ProcessManager:
                     if full_path in seen_paths:
                         continue
                     
-                    # Verify valid app directory markers
                     is_valid_app = any(os.path.exists(os.path.join(full_path, marker)) for marker in [
                         "agenta.json", "launcher.json", "package.json", "requirements.txt", ".git", "backend", "frontend"
                     ])
@@ -665,29 +675,35 @@ class ProcessManager:
         def worker():
             self.set_task_state(True, "Running System Diagnostics")
             try:
-                self.add_log("=== RUNNING AGENTA PLATFORM DIAGNOSTICS ===", "system")
+                self.add_log("╔═════════════════════════════════════════════════╗", "system")
+                self.add_log("║         AGENTA DEPENDENCY AUDIT MATRIX          ║", "system")
+                self.add_log("╠═════════════════════════════════════════════════╣", "system")
                 use_shell = (os.name == 'nt')
                 
                 is_termux = self.is_android_termux()
-                self.add_log(f"[PROFILE] Target Platform: {'Android (Termux ARM64)' if is_termux else sys.platform.title()}", "system")
-                self.add_log(f"[TUR INDEX] {TUR_PYPI_INDEX}", "system")
+                self.add_log(f"║ Platform:    {'Android (Termux ARM64)' if is_termux else sys.platform.title()}", "system")
+                self.add_log(f"║ Wheel Index: {TUR_PYPI_INDEX}", "system")
 
                 try:
                     res = subprocess.run(["python", "--version"], capture_output=True, text=True, shell=use_shell)
-                    self.add_log(f"[OK] Python version: {res.stdout.strip() or res.stderr.strip()}", "system")
+                    self.add_log(f"║ Python:      [✓] {res.stdout.strip() or res.stderr.strip()}", "system")
                 except Exception as e:
-                    self.add_log(f"[FAIL] Python check: {str(e)}", "error")
+                    self.add_log(f"║ Python:      [✗] {str(e)}", "error")
 
                 try:
                     res = subprocess.run(["node", "--version"], capture_output=True, text=True, shell=use_shell)
-                    self.add_log(f"[OK] Node.js version: {res.stdout.strip() or res.stderr.strip()}", "system")
+                    self.add_log(f"║ Node.js:     [✓] {res.stdout.strip() or res.stderr.strip()}", "system")
                 except Exception as e:
-                    self.add_log(f"[FAIL] Node.js check: {str(e)}", "error")
+                    self.add_log(f"║ Node.js:     [✗] {str(e)}", "error")
+
+                redis_running = self.is_port_in_use(6379)
+                self.add_log(f"║ Redis Svc:   {'[✓] Port 6379 Active' if redis_running else '[i] In-Memory / JSON Fallback Mode'}", "system")
+                self.add_log("╠═════════════════════════════════════════════════╣", "system")
 
                 for name, svc in self.app_config.services.items():
                     if svc["runtime"] == "python":
-                        self.add_log(f"Checking Python libraries in target folder: {svc['path']}", "system")
-                        test_script = "import sys; import fastapi; import uvicorn; import pydantic; print('OK: FastAPI/Uvicorn/Pydantic imports succeeded!')"
+                        self.add_log(f"║ Service ({name}): {svc['path']}", "system")
+                        test_script = "import sys; import fastapi; import uvicorn; import pydantic; print('✓ Imports OK')"
                         try:
                             cmd = ["python", "-c", test_script]
                             venv_py = os.path.join(svc["path"], "venv", "bin", "python")
@@ -698,31 +714,13 @@ class ProcessManager:
                             
                             res = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
                             if res.returncode == 0:
-                                self.add_log(f"[OK] Python libraries ({name}): {res.stdout.strip()}", "system")
+                                self.add_log(f"║   └─ Status: {res.stdout.strip()}", "system")
                             else:
-                                self.add_log(f"[FAIL] Python libraries ({name}) error: {res.stderr.strip()}", "error")
-                                self.add_log("[TIP] Make sure to run '2. App Modules' to trigger TUR pip install.", "system")
+                                self.add_log(f"║   └─ Status: [⚠ Unresolved Requirements]", "error")
                         except Exception as e:
-                            self.add_log(f"[FAIL] Python import test failed to run: {str(e)}", "error")
+                            self.add_log(f"║   └─ Status Error: {str(e)}", "error")
 
-                for name, svc in self.app_config.services.items():
-                    if svc["runtime"] == "node":
-                        next_binary = os.path.join(svc["path"], "node_modules", ".bin", "next")
-                        if os.path.exists(next_binary) or os.path.exists(next_binary + ".cmd"):
-                            self.add_log(f"[OK] node_modules found for {name}.", "system")
-                        else:
-                            self.add_log(f"[FAIL] node_modules is missing or incomplete for {name}.", "error")
-                            self.add_log("[TIP] Make sure to run '2. App Modules' to trigger npm install.", "system")
-
-                for name, svc in self.app_config.services.items():
-                    port = svc.get("port")
-                    if port:
-                        if self.is_port_in_use(port):
-                            self.add_log(f"[INFO] Port {port} ({name}) is CURRENTLY IN USE by an external process.", "system")
-                        else:
-                            self.add_log(f"[OK] Port {port} ({name}) is free.", "system")
-
-                self.add_log("=== DIAGNOSTICS COMPLETE ===", "system")
+                self.add_log("╚═════════════════════════════════════════════════╝", "system")
             except Exception as e:
                 self.add_log(f"Diagnostics error: {str(e)}", "error")
             finally:
