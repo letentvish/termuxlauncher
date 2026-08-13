@@ -11,12 +11,14 @@ import urllib.parse
 import traceback
 import shutil
 
-# Default configuration ports
-PORTS = {
-    "Frontend": 3000,
-    "Backend": 8000,
-    "AI Engine": 8010
-}
+# Agenta Global Directory Setup
+AGENTA_DIR = os.path.expanduser("~/.agenta")
+AGENTA_CACHE_DIR = os.path.join(AGENTA_DIR, "cache", "wheels")
+AGENTA_APPS_DIR = os.path.join(AGENTA_DIR, "apps")
+os.makedirs(AGENTA_CACHE_DIR, exist_ok=True)
+os.makedirs(AGENTA_APPS_DIR, exist_ok=True)
+
+TUR_PYPI_INDEX = "https://termux-user-repository.github.io/pypi/"
 
 def read_env(filepath):
     values = {}
@@ -40,22 +42,40 @@ def write_env(filepath, new_values):
 class AppConfig:
     def __init__(self, app_dir):
         self.app_dir = os.path.abspath(app_dir)
-        self.manifest_path = os.path.join(self.app_dir, "launcher.json")
+        self.manifest_path = os.path.join(self.app_dir, "agenta.json")
+        if not os.path.exists(self.manifest_path):
+            self.manifest_path = os.path.join(self.app_dir, "launcher.json")
         self.services = {}
         self.env_keys = []
+        self.name = "AstroDash"
+        self.platforms = {"android": True, "linux": True, "windows": True}
         self.load()
 
     def load(self):
-        # 1. Try to load launcher.json
+        # 1. Try to load agenta.json or launcher.json
         if os.path.exists(self.manifest_path):
             try:
                 with open(self.manifest_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.services = data.get("services", {})
+                    self.name = data.get("name", os.path.basename(self.app_dir))
+                    self.platforms = data.get("platforms", self.platforms)
+                    
+                    raw_services = data.get("services", {})
+                    parsed_services = {}
+                    for svc_name, svc_info in raw_services.items():
+                        rel_path = svc_info.get("path", ".")
+                        abs_path = os.path.abspath(os.path.join(self.app_dir, rel_path))
+                        parsed_services[svc_name] = {
+                            "path": abs_path,
+                            "runtime": svc_info.get("runtime", "node" if "node" in str(svc_info.get("cmd")) else "python"),
+                            "cmd": svc_info.get("cmd", []),
+                            "port": svc_info.get("port")
+                        }
+                    self.services = parsed_services
                     self.env_keys = data.get("required_keys", [])
                     return
             except Exception as e:
-                print(f"Error loading launcher.json: {e}")
+                print(f"Error loading manifest ({self.manifest_path}): {e}")
 
         # 2. Heuristics fallback stack detection
         detected_services = {}
@@ -75,7 +95,6 @@ class AppConfig:
                 if be_dir:
                     break
         
-        # Fallback to root directory
         if not be_dir:
             for entry in ["main.py", "app.py"]:
                 if os.path.exists(os.path.join(self.app_dir, entry)):
@@ -164,7 +183,6 @@ class AppConfig:
                     except:
                         pass
         
-        # Add basic fallbacks if no keys found
         if not detected_keys:
             default_keys = ["OPENAI_API_KEY", "GOOGLE_API_KEY", "NVIDIA_API_KEY", "TAVILY_API_KEY"]
             for dk in default_keys:
@@ -183,8 +201,7 @@ class ProcessManager:
         self.logs = []
         self.lock = threading.Lock()
         self.launcher_dir = os.path.dirname(os.path.abspath(__file__))
-        self.apps_dir = os.path.join(self.launcher_dir, "apps")
-        os.makedirs(self.apps_dir, exist_ok=True)
+        self.apps_dir = AGENTA_APPS_DIR
         
         self.project_dir = os.path.abspath(self.launcher_dir)
         self.app_config = AppConfig(self.project_dir)
@@ -312,6 +329,14 @@ class ProcessManager:
             shutil.which("pkg") is not None
         )
 
+    def resolve_requirements_file(self, cwd):
+        req_dir = os.path.join(cwd, "requirements")
+        if self.is_android_termux() and os.path.exists(os.path.join(req_dir, "android.txt")):
+            return os.path.join(req_dir, "android.txt")
+        elif os.path.exists(os.path.join(req_dir, "base.txt")):
+            return os.path.join(req_dir, "base.txt")
+        return os.path.join(cwd, "requirements.txt")
+
     def ensure_nextjs_swc_fix(self, frontend_path):
         babelrc = os.path.join(frontend_path, ".babelrc")
         babel_js = os.path.join(frontend_path, "babel.config.js")
@@ -399,7 +424,7 @@ class ProcessManager:
 
     def ensure_python_deps(self, service_name, cwd):
         venv_dir = os.path.join(cwd, ".venv")
-        req_path = os.path.join(cwd, "requirements.txt")
+        req_path = self.resolve_requirements_file(cwd)
         
         uvicorn_bin = os.path.join(venv_dir, "bin", "uvicorn")
         if os.name == 'nt':
@@ -420,7 +445,14 @@ class ProcessManager:
                     venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
                 
                 if os.path.exists(venv_py):
-                    proc_pip = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "--only-binary", "pydantic-core,bcrypt,greenlet,pillow", "-r", "requirements.txt"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                    pip_cmd = [
+                        venv_py, "-m", "pip", "install", 
+                        "--extra-index-url", TUR_PYPI_INDEX,
+                        "--cache-dir", AGENTA_CACHE_DIR,
+                        "--prefer-binary", 
+                        "-r", req_path
+                    ]
+                    proc_pip = subprocess.Popen(pip_cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                     for line in iter(proc_pip.stdout.readline, ''):
                         self.add_log(line.strip(), "setup")
                     proc_pip.wait()
@@ -439,12 +471,11 @@ class ProcessManager:
         cwd = svc["path"]
         cmd = svc["cmd"]
         
-        if name == "Backend" and svc.get("runtime") == "python":
-            self.ensure_backend_env()
+        if svc.get("runtime") == "python":
+            if name == "Backend":
+                self.ensure_backend_env()
             self.ensure_python_deps(name, cwd)
-        elif name == "AI Engine" and svc.get("runtime") == "python":
-            self.ensure_python_deps(name, cwd)
-        elif name == "Frontend" and svc.get("runtime") == "node":
+        elif svc.get("runtime") == "node":
             self.ensure_frontend_deps(cwd)
 
         self.run_command(cmd, cwd, name)
@@ -500,7 +531,7 @@ class ProcessManager:
         if not is_termux:
             return {"status": "error", "message": "This operation is optimized for Termux. Please install build libraries manually on your system."}
         
-        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "rust", "tur-repo"]
+        cmd = ["pkg", "install", "-y", "nodejs", "python", "git", "clang", "make", "pkg-config", "libffi", "openssl", "tur-repo"]
         self.run_command(cmd, self.project_dir, task_title="Installing System Packages")
         return {"status": "success", "message": "Triggered Termux build dependencies installation."}
 
@@ -533,10 +564,17 @@ class ProcessManager:
                             venv_py = "python"
                             self.add_log("Venv python not found, falling back to system Python.", "error")
                         
-                        self.add_log(f"Installing python dependencies in venv using {venv_py}...", "system")
-                        req_path = os.path.join(cwd, "requirements.txt")
+                        self.add_log(f"Installing python dependencies with TUR index in venv using {venv_py}...", "system")
+                        req_path = self.resolve_requirements_file(cwd)
                         if os.path.exists(req_path):
-                            proc = subprocess.Popen([venv_py, "-m", "pip", "install", "--prefer-binary", "--only-binary", "pydantic-core,bcrypt,greenlet,pillow", "-r", "requirements.txt"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
+                            pip_cmd = [
+                                venv_py, "-m", "pip", "install", 
+                                "--extra-index-url", TUR_PYPI_INDEX,
+                                "--cache-dir", AGENTA_CACHE_DIR,
+                                "--prefer-binary", 
+                                "-r", req_path
+                            ]
+                            proc = subprocess.Popen(pip_cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=use_shell)
                             for line in iter(proc.stdout.readline, ''): self.add_log(line.strip(), "setup")
                             proc.wait()
                             
@@ -603,9 +641,13 @@ class ProcessManager:
         def worker():
             self.set_task_state(True, "Running System Diagnostics")
             try:
-                self.add_log("=== RUNNING SYSTEM DIAGNOSTICS ===", "system")
+                self.add_log("=== RUNNING AGENTA PLATFORM DIAGNOSTICS ===", "system")
                 use_shell = (os.name == 'nt')
                 
+                is_termux = self.is_android_termux()
+                self.add_log(f"[PROFILE] Target Platform: {'Android (Termux ARM64)' if is_termux else sys.platform.title()}", "system")
+                self.add_log(f"[TUR INDEX] {TUR_PYPI_INDEX}", "system")
+
                 try:
                     res = subprocess.run(["python", "--version"], capture_output=True, text=True, shell=use_shell)
                     self.add_log(f"[OK] Python version: {res.stdout.strip() or res.stderr.strip()}", "system")
@@ -621,7 +663,7 @@ class ProcessManager:
                 for name, svc in self.app_config.services.items():
                     if svc["runtime"] == "python":
                         self.add_log(f"Checking Python libraries in target folder: {svc['path']}", "system")
-                        test_script = "import sys; import fastapi; import uvicorn; import pydantic; import openai; print('OK: All imports succeeded!')"
+                        test_script = "import sys; import fastapi; import uvicorn; import pydantic; print('OK: FastAPI/Uvicorn/Pydantic imports succeeded!')"
                         try:
                             cmd = ["python", "-c", test_script]
                             venv_py = os.path.join(svc["path"], "venv", "bin", "python")
@@ -635,7 +677,7 @@ class ProcessManager:
                                 self.add_log(f"[OK] Python libraries ({name}): {res.stdout.strip()}", "system")
                             else:
                                 self.add_log(f"[FAIL] Python libraries ({name}) error: {res.stderr.strip()}", "error")
-                                self.add_log("[TIP] Make sure to run '2. App Modules' to install missing requirements.", "system")
+                                self.add_log("[TIP] Make sure to run '2. App Modules' to trigger TUR pip install.", "system")
                         except Exception as e:
                             self.add_log(f"[FAIL] Python import test failed to run: {str(e)}", "error")
 
@@ -703,6 +745,8 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
                 }
             data = {
                 "project_dir": manager.project_dir,
+                "app_name": manager.app_config.name,
+                "is_termux": manager.is_android_termux(),
                 "task_state": task_state,
                 "services": {
                     name: {
@@ -728,14 +772,14 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             schema = []
             for env_item in manager.app_config.env_keys:
                 key = env_item["key"]
-                folder = env_item["dir"]
+                folder = env_item.get("dir", manager.project_dir)
                 env_path = os.path.join(folder, ".env")
                 env_data = read_env(env_path)
                 
                 schema.append({
                     "key": key,
                     "description": env_item["description"],
-                    "secret": env_item["secret"],
+                    "secret": env_item.get("secret", True),
                     "value": env_data.get(key, "")
                 })
             self.send_json({"schema": schema})
@@ -814,7 +858,7 @@ class WebLauncherHandler(http.server.BaseHTTPRequestHandler):
             try:
                 for env_item in manager.app_config.env_keys:
                     key = env_item["key"]
-                    folder = env_item["dir"]
+                    folder = env_item.get("dir", manager.project_dir)
                     
                     if key in body:
                         val = str(body[key]).strip()
@@ -873,7 +917,7 @@ HTML_UI = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>AstroDash Termux Launcher</title>
+    <title>AGENTA Local Agent Runtime</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -896,16 +940,16 @@ HTML_UI = """<!DOCTYPE html>
     <header class="border-b border-white/5 bg-slate-900/60 backdrop-blur-md sticky top-0 z-40 px-4 py-3 flex items-center justify-between">
         <div class="flex items-center space-x-2.5">
             <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-                <i class="fa-solid fa-compass text-white text-lg animate-spin-slow"></i>
+                <i class="fa-solid fa-microchip text-white text-lg"></i>
             </div>
             <div>
-                <h1 class="text-base font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-300">AstroDash Mobile</h1>
-                <p class="text-[10px] text-indigo-400 font-semibold tracking-wider uppercase">Generic Controller</p>
+                <h1 class="text-base font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-300">AGENTA Runtime</h1>
+                <p class="text-[10px] text-indigo-400 font-semibold tracking-wider uppercase" id="platformBadge">Termux ARM64</p>
             </div>
         </div>
         <div class="flex items-center space-x-2">
             <button onclick="runDiagnostics()" class="text-[10px] font-bold px-2.5 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all flex items-center gap-1">
-                <i class="fa-solid fa-stethoscope"></i> Check Health
+                <i class="fa-solid fa-stethoscope"></i> Platform Matrix
             </button>
         </div>
     </header>
@@ -913,11 +957,14 @@ HTML_UI = """<!DOCTYPE html>
     <!-- Main Container -->
     <main class="max-w-md mx-auto px-4 mt-6 space-y-6">
 
-        <!-- 1. App Library & GitHub Cloning Card -->
+        <!-- 1. Agent Library & Manifest Store -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
-            <h2 class="text-sm font-bold tracking-wide text-cyan-300 uppercase flex items-center gap-1.5">
-                <i class="fa-solid fa-square-rss text-xs"></i> App Library
-            </h2>
+            <div class="flex items-center justify-between">
+                <h2 class="text-sm font-bold tracking-wide text-cyan-300 uppercase flex items-center gap-1.5">
+                    <i class="fa-solid fa-box text-xs"></i> Agent Store & Library
+                </h2>
+                <span class="text-[9px] px-2 py-0.5 bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 rounded-md font-mono">agenta.json</span>
+            </div>
             <div class="space-y-3">
                 <div class="flex gap-2">
                     <input type="text" id="repoUrlInput" placeholder="Paste GitHub Repository URL" class="flex-1 bg-black/20 border border-white/5 rounded-xl px-4 py-2.5 text-xs focus:outline-none focus:border-indigo-500/50 transition-all font-mono" />
@@ -935,9 +982,9 @@ HTML_UI = """<!DOCTYPE html>
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
             <div class="flex items-center justify-between">
                 <h2 class="text-sm font-bold tracking-wide text-amber-400 uppercase flex items-center gap-1.5">
-                    <i class="fa-solid fa-sliders text-xs"></i> App Configurations
+                    <i class="fa-solid fa-key text-xs"></i> Secrets & API Keys
                 </h2>
-                <span class="text-[9px] text-slate-500 uppercase font-bold">Dynamic Env</span>
+                <span class="text-[9px] text-slate-500 uppercase font-bold">Runtime Context</span>
             </div>
             
             <div class="space-y-3.5" id="dynamicSettingsForm">
@@ -946,7 +993,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- 3. Folder Selection Card (Advanced) -->
+        <!-- 3. Folder Selection Card -->
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
             <div class="flex items-center justify-between">
                 <h2 class="text-sm font-bold tracking-wide text-indigo-300 uppercase flex items-center gap-1.5">
@@ -964,7 +1011,7 @@ HTML_UI = """<!DOCTYPE html>
 
         <!-- 4. Services Management -->
         <section class="space-y-3">
-            <h2 class="text-xs font-bold tracking-widest text-slate-400 uppercase px-1">Active Port Channels</h2>
+            <h2 class="text-xs font-bold tracking-widest text-slate-400 uppercase px-1">Manifest Declared Services</h2>
             
             <div class="grid gap-3" id="servicesGrid">
                 <!-- Template service cards generated via JS -->
@@ -975,8 +1022,9 @@ HTML_UI = """<!DOCTYPE html>
         <section class="bg-white/5 border border-white/10 rounded-2xl p-5 shadow-xl backdrop-blur-sm space-y-4">
             <div class="flex items-center justify-between">
                 <h2 class="text-sm font-bold tracking-wide text-purple-300 uppercase flex items-center gap-1.5">
-                    <i class="fa-solid fa-gears text-xs"></i> Installation Pipeline
+                    <i class="fa-solid fa-sliders text-xs"></i> Platform Resolution Pipeline
                 </h2>
+                <span class="text-[9px] px-2 py-0.5 bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded font-mono">TUR Wheel Index</span>
             </div>
             
             <!-- Live Progress Indicator Banner -->
@@ -991,7 +1039,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
 
             <p class="text-xs text-slate-400 leading-relaxed">
-                Run stages sequentially to configure dependencies for the currently active app.
+                Resolves prebuilt Termux ARM64 wheels via TUR index without compiling source crates on mobile.
             </p>
             <div class="grid grid-cols-3 gap-2 pt-1">
                 <button id="btn_prereqs" onclick="triggerSetup('install_prereqs')" class="p-2.5 bg-slate-900 border border-white/15 hover:border-indigo-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
@@ -1000,9 +1048,9 @@ HTML_UI = """<!DOCTYPE html>
                     <span class="text-[8px] text-slate-500 mt-0.5">Termux Pkgs</span>
                 </button>
                 <button id="btn_deps" onclick="triggerSetup('install_deps')" class="p-2.5 bg-slate-900 border border-white/15 hover:border-purple-500/50 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95">
-                    <i id="icon_deps" class="fa-solid fa-code-branch text-purple-400 text-sm mb-1 group-hover:scale-110 transition-transform"></i>
-                    <span class="text-[11px] font-bold">2. Modules</span>
-                    <span class="text-[8px] text-slate-500 mt-0.5">pip & npm</span>
+                    <i id="icon_deps" class="fa-solid fa-bolt text-purple-400 text-sm mb-1 group-hover:scale-110 transition-transform"></i>
+                    <span class="text-[11px] font-bold">2. TUR Modules</span>
+                    <span class="text-[8px] text-slate-500 mt-0.5">ARM64 Wheels</span>
                 </button>
                 <button id="btn_swc" onclick="triggerSetup('fix_swc')" class="p-2.5 bg-slate-900 border border-amber-500/30 hover:border-amber-500/60 rounded-xl flex flex-col items-center justify-center text-center group transition-all active:scale-95 bg-amber-500/5">
                     <i id="icon_swc" class="fa-solid fa-wand-magic-sparkles text-amber-400 text-sm mb-1 group-hover:scale-110 transition-transform"></i>
@@ -1034,7 +1082,7 @@ HTML_UI = """<!DOCTYPE html>
             </div>
             
             <div id="logsTerminal" class="h-64 overflow-y-auto bg-black/60 border border-white/5 rounded-xl p-3.5 font-mono text-[10px] text-slate-300 leading-relaxed custom-scrollbar space-y-1 select-all">
-                <div class="text-indigo-400/80">[SYSTEM] Terminal initialized. Waiting for process output logs...</div>
+                <div class="text-indigo-400/80">[AGENTA RUNTIME] Runtime initialized. Ready for service output...</div>
             </div>
         </section>
 
@@ -1217,7 +1265,7 @@ HTML_UI = """<!DOCTYPE html>
                 return;
             }
             
-            showToast("Cloning repository from GitHub...", "info");
+            showToast("Cloning agent app repository...", "info");
             urlInput.value = '';
             
             try {
@@ -1342,7 +1390,7 @@ HTML_UI = """<!DOCTYPE html>
         }
 
         async function runDiagnostics() {
-            showToast("Running system diagnostics tests...", "info");
+            showToast("Running Agenta platform matrix tests...", "info");
             try {
                 const res = await fetch('/api/diagnose', { method: 'POST' });
                 const data = await res.json();
@@ -1401,6 +1449,7 @@ HTML_UI = """<!DOCTYPE html>
                 const data = await res.json();
                 
                 document.getElementById('projectPathDisplay').textContent = data.project_dir;
+                document.getElementById('platformBadge').textContent = data.is_termux ? "Termux ARM64 | TUR Active" : "Desktop Local";
                 currentPath = data.project_dir;
 
                 // Handle task progress state
@@ -1444,7 +1493,7 @@ HTML_UI = """<!DOCTYPE html>
                 
                 const services = Object.keys(data.services);
                 if (services.length === 0) {
-                    grid.innerHTML = '<div class="text-xs text-slate-500 text-center py-4 bg-white/5 border border-white/5 rounded-xl">No services detected in this app context.</div>';
+                    grid.innerHTML = '<div class="text-xs text-slate-500 text-center py-4 bg-white/5 border border-white/5 rounded-xl">No services detected in this app manifest.</div>';
                     return;
                 }
 
@@ -1473,7 +1522,7 @@ HTML_UI = """<!DOCTYPE html>
                     }`;
 
                     const hostname = window.location.hostname;
-                    const url = name === 'Backend' ? `http://${hostname}:${svc.port}/docs` : `http://${hostname}:${svc.port}`;
+                    const url = name.toLowerCase().includes('backend') ? `http://${hostname}:${svc.port}/docs` : `http://${hostname}:${svc.port}`;
 
                     card.innerHTML = `
                         <div class="flex items-center justify-between">
@@ -1566,7 +1615,7 @@ HTML_UI = """<!DOCTYPE html>
         }
 
         function clearUIStatusLogs() {
-            document.getElementById('logsTerminal').innerHTML = '<div class="text-indigo-400/80">[SYSTEM] Terminal logs cleared.</div>';
+            document.getElementById('logsTerminal').innerHTML = '<div class="text-indigo-400/80">[AGENTA RUNTIME] Terminal logs cleared.</div>';
             logsLength = 0;
         }
 
@@ -1602,7 +1651,7 @@ def start_server():
             local_ip = get_ip_address()
             
             print("="*60, flush=True)
-            print(" BYO-AGENT TERMUX WEB LAUNCHER ACTIVE", flush=True)
+            print(" AGENTA LOCAL AGENT RUNTIME ACTIVE", flush=True)
             print("="*60, flush=True)
             print(f" Local Loopback Address:  http://localhost:{server_port}", flush=True)
             print(f" Mobile Network Link:    http://{local_ip}:{server_port}", flush=True)
@@ -1624,7 +1673,7 @@ if __name__ == "__main__":
     try:
         start_server()
     except KeyboardInterrupt:
-        print("\n[!] Shutting down launcher web controller server. Clearing running processes...")
+        print("\n[!] Shutting down Agenta web controller server. Clearing running processes...")
         for name in list(manager.processes.keys()):
             manager.stop_service(name)
         sys.exit(0)
