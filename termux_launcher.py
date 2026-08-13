@@ -332,14 +332,16 @@ class ProcessManager:
                 
                 cmd_to_run = list(cmd)
                 if name and self.app_config.services.get(name, {}).get("runtime") == "python":
-                    venv_py = os.path.join(cwd, "venv", "bin", "python")
+                    venv_py = os.path.join(cwd, ".venv", "bin", "python")
                     if not os.path.exists(venv_py):
-                        venv_py = os.path.join(cwd, ".venv", "bin", "python")
+                        venv_py = os.path.join(cwd, "venv", "bin", "python")
                     if not os.path.exists(venv_py) and os.name == 'nt':
-                        venv_py = os.path.join(cwd, "venv", "Scripts", "python.exe")
+                        venv_py = os.path.join(cwd, ".venv", "Scripts", "python.exe")
                     if os.path.exists(venv_py):
                         cmd_to_run[0] = venv_py
                         self.add_log(f"Using virtual environment python: {venv_py}", "system")
+                    else:
+                        self.add_log(f"Warning: Virtual environment python not found in {cwd}. Using system python.", "error")
 
                 env = dict(os.environ)
                 if name and self.app_config.services.get(name, {}).get("port"):
@@ -380,7 +382,10 @@ class ProcessManager:
                 
                 process.stdout.close()
                 rc = process.wait()
-                self.add_log(f"Process exited with code {rc}", "system")
+                if rc != 0:
+                    self.add_log(f"[{name or 'Process'}] Exited with error code {rc}. Check log stream above.", "error")
+                else:
+                    self.add_log(f"[{name or 'Process'}] Exited cleanly (code {rc}).", "system")
                 if name:
                     with self.lock:
                         if self.processes[name] == process:
