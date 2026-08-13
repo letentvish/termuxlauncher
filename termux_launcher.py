@@ -603,21 +603,45 @@ class ProcessManager:
 
     def list_apps(self):
         apps = [{
-            "name": "Default (Local)",
+            "name": f"Default ({os.path.basename(self.launcher_dir)})",
             "path": self.launcher_dir,
             "is_active": (self.project_dir == self.launcher_dir)
         }]
-        if os.path.exists(self.apps_dir):
-            for item in sorted(os.listdir(self.apps_dir)):
-                full_path = os.path.join(self.apps_dir, item)
-                if os.path.isdir(full_path):
-                    if item.startswith('.') or item == '__pycache__':
+        
+        seen_paths = {self.launcher_dir}
+
+        scan_dirs = [
+            self.apps_dir,
+            os.path.expanduser("~/apps"),
+            os.path.expanduser("~")
+        ]
+
+        for scan_dir in scan_dirs:
+            if not os.path.exists(scan_dir):
+                continue
+            try:
+                for item in sorted(os.listdir(scan_dir)):
+                    full_path = os.path.abspath(os.path.join(scan_dir, item))
+                    if not os.path.isdir(full_path) or item.startswith('.') or item in ['__pycache__', 'node_modules', '.git']:
                         continue
-                    apps.append({
-                        "name": item,
-                        "path": full_path,
-                        "is_active": (self.project_dir == full_path)
-                    })
+                    if full_path in seen_paths:
+                        continue
+                    
+                    # Verify valid app directory markers
+                    is_valid_app = any(os.path.exists(os.path.join(full_path, marker)) for marker in [
+                        "agenta.json", "launcher.json", "package.json", "requirements.txt", ".git", "backend", "frontend"
+                    ])
+                    
+                    if is_valid_app:
+                        seen_paths.add(full_path)
+                        apps.append({
+                            "name": item,
+                            "path": full_path,
+                            "is_active": (self.project_dir == full_path)
+                        })
+            except Exception as e:
+                pass
+
         return apps
 
     def clone_app(self, repo_url):
